@@ -5,9 +5,9 @@ This repository contains variants of the AttentionFMHA kernel, focusing on stati
 ## Variants
 
 - **Full Static**: Top-down static scheduling.
-- **Full Static Alt**: Top-down static scheduling with alternating (sawtooth) atomic updates.
+- **Full Static Alt**: Top-down static scheduling with alternating (sawtooth) K/V traversal.
 - **Tile**: Tile-based scheduling.
-- **Tile Alt**: Tile-based scheduling with alternating (sawtooth) atomic updates.
+- **Tile Alt**: Tile-based scheduling with alternating (sawtooth) K/V traversal.
 
 ## Study 5: L2 Cache Misses & Throughput (Top-Down vs Tile-Based)
 
