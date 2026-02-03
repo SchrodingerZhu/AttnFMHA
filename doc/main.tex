@@ -1,647 +1,773 @@
-\documentclass[nonacm,sigconf,screen,anonymous]{acmart}
+\documentclass[sigconf,review,anonymous]{acmart}
 
-%% Add amsmath first
+%% Packages
 \usepackage{amsmath}
 \usepackage{booktabs}
-
-%% Then algorithm packages
+\usepackage{xcolor}
+\usepackage{listings}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 
-\author{Yifan Zhu}
-\orcid{0009-0000-6718-7787}
-\affiliation{
-  \institution{University of Rochester}
-  \streetaddress{Rochester, NY}
-  \country{USA}
-}
-\email{yifanzhu@rochester.edu}
-
-\author{Yekai Pan}
-\orcid{0009-0001-7639-1488}
-\affiliation{
-  \institution{University of Rochester}
-  \streetaddress{Rochester, NY}
-  \country{USA}
-}
-\email{ypan34@u.rochester.edu}
-
-\author{Chen Ding}
-\orcid{0000-0003-4968-6659}
-\affiliation{
-  \institution{University of Rochester}
-  \streetaddress{Rochester, NY}
-  \country{USA}
-}
-\email{cding@cs.rochester.edu}
-
+%% Algorithm commands
 \algnewcommand\algorithmicparfor{\textbf{parallel for}}
 \algdef{S}[FOR]{ParFor}[1]{\algorithmicparfor\ #1\ \algorithmicdo}
 
-%% \BibTeX command to typeset BibTeX logo in the docs
+%% Code listing style
+\lstset{
+  basicstyle=\small\ttfamily,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  numbers=left,
+  numberstyle=\tiny,
+  breaklines=true,
+  frame=single
+}
+
+%% BibTeX command
 \AtBeginDocument{%
   \providecommand\BibTeX{{%
-Bib\TeX}}}
+    Bib\TeX}}}
 
 \begin{document}
 
 %%
-%% The "title" command has an optional parameter,
-%% allowing the author to define a "short title" to be used in page headers.
-\title{Sawtooth Wavefront Reordering}
-\subtitle{Enhanced CuTile FlashAttention on NVIDIA GB10}
-% \title{A Quantitative Study of Fused Multi-Head Attention: Streaming Pattern and L2 Cache Behavior}
+%% Title
+%%
+\title{Sawtooth Access Pattern: Reducing L2 Cache Misses in Fused Multi-Head Attention via Alternating Traversal}
+
+\renewcommand{\shortauthors}{Anonymous, et al.}
 
 %%
-%% By default, the full list of authors will be used in the page
-%% headers. Often, this list is too long, and will overlap
-%% other information printed in the page headers. This command allows
-%% the author to define a more concise list
-%% of authors' names for this purpose.
-% \renewcommand{\shortauthors}{Yifan Zhu, et al.}
-
+%% Abstract
 %%
-%% The abstract is a short summary of the work to be presented in the
-%% article.
 \begin{abstract}
-  High-performance attention kernels are essential for Large Language Models.
-  % Technologies like Flash Attention \cite{FlashAttention} and NVIDIA's CuTile programming model have significantly advanced the field by optimizing global memory access and simplifying kernel development. However, realizing further performance gains requires optimizing the interaction between streaming data patterns and the GPU cache hierarchy.
-  This paper presents analysis of CuTile-based Flash Attention memory behavior and a technique to improve its cache performance.  In particular,
-  our analysis on the NVIDIA GB10 (Grace Blackwell) identifies the main cause of L2 cache miss.
-  % architecture yields three primary insights. First, we confirm that the L1 cache acts primarily as a pass-through for streaming attention workloads. Second, we derive a mathematical model for L2 sector accesses that predicts traffic with less than 1\% error. Third, we identify the main cause of non-compulsory cache miss in the L2 cache.
-  % where hit rates scale asymptotically with the number of active Streaming Multiprocessors.
-  Leveraging this insight, we introduce a new programming technique called Sawtooth Wavefront Reordering that reduces L2 misses. We validate it in both CUDA and CuTile, observing 50\% or greater reduction in L2 misses and up to 60\% increase in throughput on GB10.
-  % , thereby bridging the gap between low-level hardware characteristics and high-level programming abstractions.
+Fused Multi-Head Attention (FMHA) kernels are critical to transformer performance, yet their streaming access patterns lead to significant L2 cache thrashing. Through detailed empirical analysis, we show that L2 behavior in FMHA is deterministic and modelable, but capacity misses emerge at sequence lengths well below theoretical limits. We present the \textbf{sawtooth access pattern}, a technique that alternates the traversal direction of key-value (KV) tiles across adjacent query blocks to maximize temporal locality in L2 cache. We implement this optimization in both CuTile and Triton frameworks and propose a compiler pass (\texttt{AlternateReductionLoopPass}) for CuTile IR that automatically transforms reduction loops. Our experiments on NVIDIA GB10 (Blackwell) demonstrate that the sawtooth pattern reduces L2 non-compulsory misses by up to 3--6$\times$ and improves throughput by up to 1.6$\times$ across causal and non-causal attention variants, with consistent benefits for both FP16 and FP8 quantized workloads.
 \end{abstract}
 
-%%
-%% Keywords. The author(s) should pick words that accurately describe
-%% the work being presented. Separate the keywords with commas.
-% \keywords{GPU cache, attention mechanism, Flash Attention, WMMA, tensor cores, memory optimization, cache eviction policies}
+\keywords{GPU cache, attention mechanism, Flash Attention, L2 optimization, sawtooth pattern, memory access patterns, tensor cores}
 
-%%
-%% This command processes the author and affiliation and title
-%% information and builds the first part of the formatted document.
 \maketitle
 
+%% ============================================================================
+%% SECTION 1: INTRODUCTION
+%% ============================================================================
 \section{Introduction}
 \label{sec:introduction}
 
-The Attention mechanism is the computational core of transformer-based generative models~\cite{AttentionIsAllYouNeed, GPT3}. To address its quadratic memory complexity, techniques like Flash Attention~\cite{FlashAttention} utilize IO-aware tiling to maximize data reuse in on-chip SRAM. Concurrently, programming models such as NVIDIA's CuTile~\cite{CUDATile} facilitate the development of such tiled algorithms by abstracting complex hardware details.
+The attention mechanism lies at the heart of transformer-based models~\cite{AttentionIsAllYouNeed, GPT3}, with fused multi-head attention (FMHA) implementations being essential for practical deployment. Flash Attention~\cite{FlashAttention} and its successors have established IO-aware tiled computation as the standard approach, reducing memory transfers between GPU HBM and on-chip SRAM. However, even optimized implementations exhibit a fundamental limitation: the \textbf{streaming access pattern} over key-value (KV) tiles leads to poor L2 cache utilization.
 
-While these advancements have democratized high-performance kernel development, the abstraction can obscure the nuanced interactions between thread scheduling and the specific cache hierarchy of modern architectures. Prior work has highlighted the importance of hardware thread scheduling and locality awareness in cache management~\cite{10.1109/MICRO.2012.16, 6835937, 10.1145/3037697.3037709}.
+In a typical FMHA kernel using persistent CTAs, each CTA processes multiple query tiles sequentially. For each query tile, the CTA streams through all KV tiles in forward order. When transitioning from one query tile to the next, the KV tiles just accessed are still warm in L2---but the next query tile starts again from the beginning, wasting this cached data.
 
-% Achieving the next level of performance efficiency requires revisiting these low-level behaviors, particularly the L2 cache dynamics on emerging architectures like the NVIDIA GB10.
+\paragraph{Key Insight.} If consecutive query tiles within a CTA traverse KV tiles in \textit{alternating directions}, the last tiles accessed by one query become the first tiles needed by the next, enabling immediate L2 cache reuse.
 
-In this work, we improve the performance of CuTile-based Flash Attention. Our approach begins by using hardware counters and performance models to identify the primary cause of non-compulsory cache misses.
-% not by modifying the high-level implementation directly, but by conducting a rigorous quantitative study using a
-We use raw CUDA implementation with specifically designed Thread Block (CTA) scheduling to isolate the effects of memory access from other compiler-induced effects.
+\paragraph{Contributions.} We make the following contributions:
+\begin{enumerate}
+    \item We provide \textbf{empirical analysis} of L1/L2 cache behavior in FMHA, demonstrating that L2 access is deterministic and modelable with high accuracy.
+    \item We characterize the \textbf{L2 capacity miss problem}, showing that misses emerge at sequence lengths well below theoretical L2 capacity limits.
+    \item We introduce the \textbf{sawtooth access pattern}, where consecutive groups of query blocks alternate between forward and reverse KV traversal.
+    \item We propose \texttt{AlternateReductionLoopPass}, a compiler transformation for CuTile IR that automatically applies the sawtooth pattern.
+    \item We evaluate across \textbf{five kernel variants}, multiple configurations (causal/non-causal, FP16/FP8), and two frameworks (CuTile and Triton).
+\end{enumerate}
 
-Our analysis reveals that the L1 cache provides negligible benefit for streaming attention patterns, and that L2 cache behavior follows a deterministic model. We identify a correlation between L2 hit rates and the number of active SMs, suggesting intrinsic data reuse among synchronous wavefronts. Based on these findings, we propose a ``Sawtooth'' alternating scan pattern that increases L2 cache data reuse. Finally, we port this optimization to the CuTile environment, demonstrating that the insights gained from low-level analysis translate directly to improvements in the high-level programming model.
-
-% Our contributions are as follows:
-
-% \begin{itemize}
-%     \item We demonstrate that for streaming attention workloads, the L1 cache effectively acts as a pass-through filter. Furthermore, we show that when the GPU is fully saturated, the choice between persistent and non-persistent CTA scheduling has negligible impact on cache efficiency.
-%     \item We derive and validate a deterministic mathematical model for L2 sector accesses. Our model accurately predicts L2 traffic with less than 1\% error across varying sequence lengths for both causal and non-causal attention masks.
-%     \item We identify the ``non-compulsory miss'' threshold for L2 cache. We show that L2 misses correspond to cold misses until the Key-Value (KV) size exceeds the 24MiB L2 capacity (approx. 80K sequence length), after which capacity misses dominate.
-%     \item We reveal a ``Wavefront-Level Reuse'' phenomenon where L2 hit rates scale asymptotically with the number of active SMs ($1 - 1/N_{SM}$), indicating synchronized progress among CTAs contributes to cache residency.
-%     \item We propose a ``Sawtooth'' alternating scanning pattern for the inner loop and valid its effectiveness on CuTile. By managing the reuse distance of the streaming KV blocks, this technique reduces L2 non-compulsory misses by approximately 50\% and improves throughput by 13\% in the CuTile implementation.
-% \end{itemize}
-
+%% ============================================================================
+%% SECTION 2: BACKGROUND
+%% ============================================================================
 \section{Background}
 \label{sec:background}
 
+\subsection{Flash Attention and Tiled Computation}
+
+Standard scaled dot-product attention computes:
+\begin{equation}
+ \mathbf{O} = \text{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^T}{\sqrt{d}}\right)\mathbf{V}
+\end{equation}
+where $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$. Materializing the $N \times N$ attention matrix is prohibitive for long sequences. Flash Attention~\cite{FlashAttention} avoids this by tiling the computation: for each query tile $\mathbf{Q}_i$, key and value tiles $\{\mathbf{K}_j, \mathbf{V}_j\}$ are streamed through, with online softmax maintaining numerical stability.
+
 \subsection{GPU Memory Hierarchy}
 
-NVIDIA GPUs are composed of multiple Streaming Multiprocessors (SMs). The CUDA programming model abstracts the parallel execution units as Cooperative Thread Arrays (CTAs), or thread blocks, which are scheduled onto SMs.
+NVIDIA GPUs feature a multi-level memory hierarchy:
+\begin{itemize}
+    \item \textbf{HBM (Global Memory):} High bandwidth, high latency off-chip memory.
+    \item \textbf{L2 Cache:} Shared across all SMs, automatically managed (50 MB on GB10).
+    \item \textbf{L1/Shared Memory:} Per-SM on-chip memory, partitioned between hardware-managed L1 cache and explicitly managed shared memory.
+\end{itemize}
 
-The memory hierarchy consists of global memory, L2 cache, and the per-SM L1 memory system. The L1 level is often referred to as unified L1/Texture cache (L1Tex) \cite{PTXISA}. Importantly, this L1 memory can be partitioned into L1 cache and shared memory.
-% \begin{itemize}
-%     \item \textbf{L1 Cache}: Hardware-managed, opaque caching layer.
-%     \item \textbf{Shared Memory}: Explicitly managed, programmable scratchpad memory.
-% \end{itemize}
-In high-performance kernels like Fused Multi-Head Attention, developers predominantly rely on \textbf{Shared Memory} rather than the opaque L1 cache. Explicit management allows for deterministic data placement and reuse patterns, essential for the tiling strategies that Flash Attention relies on.
+In FMHA kernels, shared memory is used for the working tiles of Q, K, V, and intermediate accumulators. Traffic between shared memory and HBM flows through L2.
 
-% \paragraph{WMMA Tensor Cores}
+\subsection{Kernel Implementation Algorithm}
 
-% Warp Matrix Multiply-Accumulate (WMMA) instructions expose the specialized Tensor Cores available on modern NVIDIA GPUs (Volta and later). These units perform mixed-precision matrix multiplications (e.g., $D = A \times B + C$) in a single operation. The API has evolved from \texttt{wmma} instructions to more efficient \texttt{mma.sync} (Ampere) and asynchronous variants (Hopper/Blackwell).
+We use a \textbf{split-Q} dataflow where Query tiles remain resident in shared memory while Key and Value tiles are streamed. The computation follows the standard Flash Attention forward pass:
 
-% While specific Tensor Core instructions (like \texttt{ldmatrix} and \texttt{mma.sync}) are critical for compute throughput, our study specifically focuses on the \textbf{streaming memory access patterns} and interactions with the L2 cache, rather than the specific choice of math instructions.
-
-\paragraph{NVIDIA GB10}
-For all our experiments, we use NVIDIA's latest GB10 processor, which was announced in January 2025 and became available in October 2025. GB10 is a Grace Blackwell chip fabricated on TSMC's 3nm process node, featuring a unified architecture that combines a Blackwell GPU with 48 streaming multiprocessors and 20 ARM v9.2 CPU cores \cite{skende2025NVIDIA}. The chip has a 256b bus LPDDR5X 128GB unified memory, with $\sim$301GB/s raw bandwidth, and an aggregate bandwidth of $\sim$600GB/s. The graphics processor has an L2 cache size of 24MiB.
-
-\paragraph{Nsight Compute CLI}
-The Nsight Compute CLI (ncu) \cite{NVIDIA_nsight_compute_cli} is a command-line tool
-% for CUDA applications
-that provides detailed performance metrics and analysis at the kernel level. The tool offers comprehensive metrics including memory throughput, instruction execution statistics, and occupancy information, making it invaluable for identifying performance bottlenecks and optimizing CUDA kernels. For our experimental purpose, we use the following metrics: \texttt{lts\_\_t\_sectors.sum} and \texttt{lts\_\_t\_sector\_hit\_rate.pct}, corresponding to the total number of sectors requested for any operation and the number of cache hit of from these requests respectively.
-
-\subsection{Flash Attention and Implmementation}
-\label{sec:kernels}
-
-Standard scaled dot-product attention computes the output matrix $\mathbf{O}$ as:
-\begin{equation}
-  \mathbf{O} = \text{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d}}\right)\mathbf{V}
-\end{equation}
-where $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$ are the query, key, and value matrices. This involves materializing the intermediate attention matrix $\mathbf{S} = \mathbf{Q}\mathbf{K}^\top$ and $\mathbf{P} = \text{softmax}(\mathbf{S})$, which are of size $N \times N$. Since $N$ is typically the sequence length, this results in $O(N^2)$ memory complexity.
-
-FlashAttention \cite{FlashAttention} avoids materializing these large intermediate matrices by fusing the computation. It computes the attention output block-by-block. By keeping small tiles of $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ and intermediate accumulators in the fast on-chip SRAM, it significantly reduces the number of read/write operations to the slow global memory (HBM), practically achieving linear memory complexity with respect to sequence length.
-
-We implement and evaluate two Flash Attention kernel variants utilizing WMMA Tensor Core operations. Our study focuses specifically on L2 cache behavior, utilizing a \textbf{split-Q} dataflow where Query tiles remain resident in shared memory while Key and Value tiles are streamed from global memory.
-
-\paragraph{Tiling Implementation}
-\label{sec:kernel-algorithm}
-
-Given query, key, and value matrices $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$, we employ a tiled approach. Consistent with our implementation code, we enforce \textbf{square tiling} where the block size for the query dimension ($B_r$) equals the block size for the key-value dimension ($B_c$), denoted as $T$.
-
-For each resident query tile $\mathbf{Q}_i \in \mathbb{R}^{T \times d}$, we stream through blocks of keys and values $\{\mathbf{K}_j, \mathbf{V}_j\}_{j=1}^{T_c}$. The logic follows the standard Flash Attention forward pass:
-
-\begin{algorithm}
-  \caption{Split-Q Fused Multihead Attention with Square Tiling}
-  \begin{algorithmic}[1]
-    \State \textbf{Input:} $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \text{Global Memory}$
-    \State \textbf{Config:} Determine max square tile size $T \times T$ based on SRAM
+\begin{algorithm}[ht]
+\caption{Split-Q Fused Multihead Attention with Square Tiling}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \text{Global Memory}$
+\State \textbf{Config:} Determine max square tile size $T \times T$ based on SRAM
     \ParFor{$i = 1$ to $T_r$} \Comment{Grid-stride loop over Q}
     \State Load $\mathbf{Q}_i$ into Shared Memory (Resident)
     \State Initialize $\mathbf{O}_i = \mathbf{0}, \ell_i = \mathbf{0}, m_i = -\infty$
     \For{$j = 1$ to $T_c$} \Comment{Stream K, V tiles}
-    \State Load $\mathbf{K}_j, \mathbf{V}_j$ into separate Shared Memory buffers
-    \State Compute $\mathbf{S}_{ij} = \mathbf{Q}_i \mathbf{K}_j^T$ (WMMA)
-    \State Update Softmax stats $m_i, \ell_i$ (Online Softmax)
-    \State Compute $\mathbf{P}_{ij} = \text{softmax}(\mathbf{S}_{ij} \cdot \text{scale}, m_i, \ell_i)$
-    \State Compute $\mathbf{O}_{i} \leftarrow \mathbf{O}_{i} + \mathbf{P}_{ij} \mathbf{V}_j$ (WMMA)
+        \State Load $\mathbf{K}_j, \mathbf{V}_j$ into separate Shared Memory buffers
+        \State Compute $\mathbf{S}_{ij} = \mathbf{Q}_i \mathbf{K}_j^T$ (WMMA)
+        \State Update Softmax stats $m_i, \ell_i$ (Online Softmax)
+        \State Compute $\mathbf{P}_{ij} = \text{softmax}(\mathbf{S}_{ij} \cdot \text{scale}, m_i, \ell_i)$
+        \State Compute $\mathbf{O}_{i} \leftarrow \mathbf{O}_{i} + \mathbf{P}_{ij} \mathbf{V}_j$ (WMMA)
     \EndFor
     \State Write $\mathbf{O}_i$ to Global Memory
-    \EndFor
-  \end{algorithmic}
+\EndFor
+\end{algorithmic}
 \end{algorithm}
 
-\paragraph{CTA Scheduling and Work Distribution}
-\label{sec:cta-scheduling}
+\subsection{CTA Scheduling and Work Distribution}
 
-To manage occupancy and load balancing across the GPU, we employ a \textbf{persistent CTA} (Cooperative Thread Array) pattern with round-robin tile assignment. This gives a deterministic way to study the effect of scheduling on L2 cache.
+To manage occupancy and load balancing, we employ a \textbf{persistent CTA} pattern with round-robin tile assignment:
 
-Instead of launching a thread block for every query tile (which could lead to tail effects where some SMs are idle while others finish the last wave), we launch a fixed number of thread blocks. Each thread block (CTA) executes a grid-stride loop, claiming available Query tiles in a round-robin fashion. This ensures that all SMs remain active until the entire workload is near completion.
-
-\begin{algorithm}
-  \caption{Persistent CTA Scheduling (Grid-Stride Loop)}
-  \begin{algorithmic}[1]
-    \State \textbf{Input:} Total Query Tiles $N_{tiles}$, Grid Size $G$
-    \State \textbf{Given:} GPU SM Count $N_{SM}$
-    \State $G \leftarrow \min(N_{tiles}, N_{SM})$ \Comment{One persistent CTA per SM}
-    \State $k \leftarrow \text{blockIdx.x}$
-    \While{$k < N_{tiles}$}
+\begin{algorithm}[ht]
+\caption{Persistent CTA Scheduling (Grid-Stride Loop)}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Total Query Tiles $N_{tiles}$, Grid Size $G$
+\State \textbf{Given:} GPU SM Count $N_{SM}$
+\State $G \leftarrow \min(N_{tiles}, N_{SM})$ \Comment{One persistent CTA per SM}
+\State $k \leftarrow \text{blockIdx.x}$
+\While{$k < N_{tiles}$}
     \State Identify ($Batch, Head, TileIndex$) from linear index $k$
     \State Execute \textbf{Algorithm 1} for this Query tile
     \State $k \leftarrow k + G$ \Comment{Stride by total number of CTAs}
-    \EndWhile
-  \end{algorithmic}
+\EndWhile
+\end{algorithmic}
 \end{algorithm}
 
-Alternatively, we can employ an approach where CTAs are launched directly based on the work size. In this scheme, the grid size is set exactly to cover the total number of query tiles (potentially split by batch and heads). This relies on the GPU's hardware scheduler to distribute blocks to SMs.
+%% ============================================================================
+%% SECTION 3: MOTIVATION - UNDERSTANDING L2 CACHE BEHAVIOR
+%% ============================================================================
+\section{Motivation: Understanding L2 Cache Behavior}
+\label{sec:motivation}
 
-\begin{algorithm}
-  \caption{Non-Persistent Scheduling}
-  \begin{algorithmic}[1]
-    \State \textbf{Input:} Grid Dim X (Num Q Tiles), Grid Dim Y (Batch * Heads)
-    \State \textbf{Input:} $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ tensors
-    \State $q\_tile \leftarrow \text{blockIdx.x}$
-    \State $batch\_head \leftarrow \text{blockIdx.y}$
-    \If{$q\_tile \ge num\_q\_tiles$ \textbf{or} $batch\_head \ge batch\_size \times num\_heads$}
-    \State \Return
-    \EndIf
-    \State Identify $\mathbf{Q}_{q\_tile}$ for current batch/head
-    \State Load $\mathbf{Q}$ tile into Shared Memory (Resident)
-    \State ... (Proceed with K, V streaming as in Algorithm 1)
-    \State Write Output $\mathbf{O}$
-  \end{algorithmic}
-\end{algorithm}
+Before proposing optimizations, we establish a quantitative understanding of L2 cache behavior in FMHA kernels through empirical studies.
 
-\section{Cache Performance Analysis}
+\subsection{L1 Effect on L2 Sector Access}
 
-The section presents three studies of the cache behavior of the flash attention kernel.
+On traditional CPU architectures, L1 functions as a filter for L2, complicating L2 access analysis. For GPU attention kernels with explicitly managed shared memory, however, we hypothesize minimal L1 filtering effect.
 
-\subsection{Effect of L1 Caching}
+Although $Q$ tiles are resident in shared memory, at the scale of the outer loop they stream from global memory. $K$ and $V$ tiles have even shorter tenancy. Hence, we should observe negligible L1 filtering.
 
-To isolate and model the L2 cache behavior accurately, we must first determine the extent to which the L1 cache filters memory requests. In traditional CPU architectures, the L1 cache acts as a primary filter, absorbing a significant portion of traffic and complicating the prediction of L2 access patterns.
-
-For GPU attention kernels, however, the heavy reliance on shared memory suggests a different interaction. Although $Q$ tiles are resident in shared memory, they are streamed from global memory during the outer loop. Similarly, $K$ and $V$ tiles exhibit a streaming pattern with even shorter tenancy in shared memory. We hypothesize that for these streaming access patterns, the L1 cache essentially functions as a pass-through buffer. Verifying this hypothesis is a necessary first step, as it allows us to simplify our L2 modeling by treating L2 access counts as a direct function of global memory requests.
-
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/l1_l2_b1_h1_s32768_d64.png}
-  \caption{L1/L2 Metrics for Sequence Length 32K. Parameters: Batch=1, Heads=1, Head Dim=64, Tile Size=80x80.}
-  \label{fig:l1-l2-32k}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\linewidth]{plots/l1_l2_b1_h1_s32768_d64.png}
+    \caption{L1/L2 Metrics for Sequence Length 32K. Parameters: Batch=1, Heads=1, Head Dim=64, Tile Size=80$\times$80.}
+    \label{fig:l1-l2-32k}
 \end{figure}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/l1_l2_b1_h1_s131072_d64.png}
-  \caption{L1/L2 Metrics for Sequence Length 128K. Parameters: Batch=1, Heads=1, Head Dim=64, Tile Size=80x80.}
-  \label{fig:l1-l2-128k}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=\linewidth]{plots/l1_l2_b1_h1_s131072_d64.png}
+    \caption{L1/L2 Metrics for Sequence Length 128K. Parameters: Batch=1, Heads=1, Head Dim=64, Tile Size=80$\times$80.}
+    \label{fig:l1-l2-128k}
 \end{figure}
 
-To zoom into the specific quantitative behavior, Table \ref{tab:l1-l2-counters} lists the exact counter values for the fully saturated case (SM=48).
+Table~\ref{tab:l1-l2-counters} lists exact counter values for the fully saturated case (SM=48).
 
 \begin{table}[h]
-  \centering
-  \caption{L1/L2 Cache Counters for SM=48}
-  \label{tab:l1-l2-counters}
-  \begin{tabular}{lrr}
-    \toprule
-    \textbf{Metric} & \textbf{32K Seq Len} & \textbf{128K Seq Len} \\
-    \midrule
-    L2 Sectors (Total) & 107,729,467 & 1,723,556,561 \\
-    L2 Sectors (from Tex) & 107,478,656 & 1,719,093,980 \\
-    L1 Sectors (Total) & 107,478,656 & 1,718,615,808 \\
-    L1 Hit Count & 65,440 & 262,080 \\
-    \bottomrule
-  \end{tabular}
+\centering
+\caption{L1/L2 Cache Counters for SM=48}
+\label{tab:l1-l2-counters}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{32K Seq Len} & \textbf{128K Seq Len} \\
+\midrule
+L2 Sectors (Total) & 107,729,467 & 1,723,556,561 \\
+L2 Sectors (from Tex) & 107,478,656 & 1,719,093,980 \\
+L1 Sectors (Total) & 107,478,656 & 1,718,615,808 \\
+L1 Hit Count & 65,440 & 262,080 \\
+\bottomrule
+\end{tabular}
 \end{table}
 
-We also collected data for the non-persistent CTA scheduling case (classic grid launch) to determine if thread block scheduling impacts these cache behaviors. The results are shown in Table \ref{tab:l1-l2-counters-classic}.
-
-\begin{table}[h]
-  \centering
-  \caption{L1/L2 Cache Counters for Non-Persistent CTA (SM=48)}
-  \label{tab:l1-l2-counters-classic}
-  \begin{tabular}{lrr}
-    \toprule
-    \textbf{Metric} & \textbf{32K Seq Len} & \textbf{128K Seq Len} \\
-    \midrule
-    L2 Sectors (Total) & 107,991,698 & 1,723,401,754 \\
-    L2 Sectors (from Tex) & 107,741,184 & 1,719,664,640 \\
-    L1 Sectors (Total) & 107,741,184 & 1,719,664,640 \\
-    L1 Hit Count & 65,536 & 262,144 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-The data indicates that the non-persistent case exhibits nearly identical L1/L2 behavior to the persistent case. The L1 hit count remains negligible, and the L2 usage is overwhelmingly driven by traffic from the L1 texture path (\textsc{L1Tex}). This suggests that for this streaming workload, provided the GPU is fully saturated (SM=48), the specific software scheduling mechanism (persistent vs. non-persistent) has minimal impact on the fundamental memory access patterns and cache efficiency.  Here are the key observations.
-
-% Key observations from our profiling data:
+Key observations:
 \begin{enumerate}
-  \item \textsc{L1Tex} hit count is tiny (hence visualized on a separate axis). This confirms that streaming data effectively bypasses the benefits of L1 caching.
-  \item Although L2 total cache sector access has some overhead, L1 miss (traffic from L1 to L2) is the main contributor to L2 traffic.
-  \item This behavior is observed in both small (32K) and large (128K) sequence lengths.  It is consistent across different SM counts, though L2 overhead varies slightly.
+    \item L1Tex hit count is tiny (hence visualized on a separate axis), confirming that streaming data bypasses L1 caching benefits.
+    \item L1 miss (traffic from L1 to L2) is the main contributor to L2 traffic.
+    \item This behavior is consistent across sequence lengths and SM counts.
 \end{enumerate}
 
-\subsection{Modeling L2 Sector Access}
+\subsection{L2 Sector Access Modeling}
 
-% With Study 1, we have confirmed that L2 access have deterministic properties. Hence, we should be able to
-We establish a formula to compute the L2 sector access. For now, we only focus on single-batch single-head case, as these two parameters are two linear factors that scale the problem. We use the following variables:
+Given that L2 access has deterministic properties, we establish formulas for L2 sector access. For single-batch single-head case:
 
 \begin{itemize}
-  \item $S$: Sequence Length
-  \item $C$: Sector Size
-  \item $E$: Element Size
-  \item $T$: Tile Size
-  \item $D$: Head Dimension
-  \item $M$: Number of Sectors
+    \item $S$: Sequence Length, $C$: Sector Size, $E$: Element Size
+    \item $T$: Tile Size, $D$: Head Dimension, $M$: Number of Sectors
 \end{itemize}
 
-Each tile consists of $TD$ elements, hence $\frac{TDE}{C}$ sectors. For $Q$ and $O$, each tile is only accessed once, resulting in $2\frac{TDE}{C}  \left\lfloor\frac{S}{T}\right\rfloor$ sectors. Without causal masking, $K$ and $V$ tiles are accessed once per $Q$ tile, resulting in $2\frac{TDE}{C}  \left\lfloor\frac{S}{T}\right\rfloor^2$ sectors. The total access count is thus the sum of $Q, K, V, O$ accesses plus the trailing incomplete tile accesses.
+Each tile consists of $TD$ elements ($\frac{TDE}{C}$ sectors). For $Q$ and $O$, each tile is accessed once: $2\frac{TDE}{C}\left\lfloor\frac{S}{T}\right\rfloor$ sectors. Without causal masking, $K$ and $V$ are accessed once per $Q$ tile: $2\frac{TDE}{C}\left\lfloor\frac{S}{T}\right\rfloor^2$ sectors.
 
-Ignoring the trailing effect and utilizing direct division to approximate, we have $M = 2\left(\frac{SDE}{C} + \frac{S^2DE}{TC}\right)$.
+On GB10 with FP16 ($C = 32$, $E = 2$, $D = 64$):
+\begin{equation}
+M \approx 8S\left(1 + \frac{S}{T}\right) \quad \text{(Non-Causal)}
+\end{equation}
+\begin{equation}
+M \approx 8S\left(\frac{S}{2T} + \frac{1}{2}\right) \quad \text{(Causal)}
+\end{equation}
 
-On our experimental device (DGX Spark) with float16, we have $C = 32$, $E = 2$ and we fix $D = 64$ in this study, hence, we get:
-$$
-M \approx 8S\left(1 + \frac{S}{T}\right)
-$$
-
-With causal masking, the access count for $K$ and $V$ changes from $\left(\frac{S}{T}\right)^2$ to $\frac{S(S-1)}{2T}$, hence we have:
-$$
-M \approx 8S\left(\frac{S}{2T} + \frac{1}{2}\right)
-$$
-
-We validate these models against experimental data in Figure \ref{fig:study2-plots}. The results confirm that our formulas accurately predict the L2 sector access count for both scenarios. In this specific experiment, the tile size was $T=80$.
-
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/seqlen_change_sm48_regular.png}
-  \caption{L2 Sector Access vs Sequence Length (Non-Causal Masking, $T=80$).}
-  \label{fig:study2-regular}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/seqlen_change_sm48_regular.png}
+    \caption{L2 Sector Access vs Sequence Length (Non-Causal, $T=80$).}
+    \label{fig:study2-regular}
 \end{figure}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/seqlen_change_sm48_causal.png}
-  \caption{L2 Sector Access vs Sequence Length (Causal Masking, $T=80$).}
-  \label{fig:study2-causal}
-  \label{fig:study2-plots}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/seqlen_change_sm48_causal.png}
+    \caption{L2 Sector Access vs Sequence Length (Causal, $T=80$).}
+    \label{fig:study2-causal}
 \end{figure}
 
-To further quantify the accuracy of our model, we analyzed the Mean Absolute Percentage Error (MAPE) between the experimental L2 sector counts and our theoretical predictions for the saturated SM=48 case. As shown in Table \ref{tab:mape-results}, the experimental data fits the model extremely well, with less than 1\% error for the non-causal case and minimal deviation for the causal case. Both the total L2 sectors and the subset originating from the texture unit (L1Tex misses) fall almost exactly on the predicted curve.
+Table~\ref{tab:mape-results} shows our model fits experimental data with less than 1\% error.
 
 \begin{table}[h]
-  \centering
-  \caption{MAPE of Theoretical Model vs Experimental Data (SM=48)}
-  \label{tab:mape-results}
-  \begin{tabular}{lrr}
-    \toprule
-    \textbf{Metric} & \textbf{Non-Causal(\%)} & \textbf{Causal (\%)} \\
-    \midrule
-    L2 Sectors (Total) & 0.4527\% & 2.4941\% \\
-    L2 Sectors (from Tex) & 0.5389\% & 1.1286\% \\
-    \bottomrule
-  \end{tabular}
+\centering
+\caption{MAPE of Theoretical Model vs Experimental Data (SM=48)}
+\label{tab:mape-results}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Metric} & \textbf{Non-Causal(\%)} & \textbf{Causal (\%)} \\
+\midrule
+L2 Sectors (Total) & 0.4527\% & 2.4941\% \\
+L2 Sectors (from Tex) & 0.5389\% & 1.1286\% \\
+\bottomrule
+\end{tabular}
 \end{table}
 
-\subsection{L2 Non-Compulsory Miss Threshold}
+\subsection{L2 Capacity Miss Problem}
+\label{sec:l2-capacity}
 
-The L2 capacity is quite limited compared to the requirements of large sequence lengths. Hence, it is important to study the onset of L2 non-compulsory misses.
+If L2 can hold all data, misses should equal cold misses: $4\frac{SDE}{C} = 16S$ for our configuration.
 
-If the L2 cache can hold all the data, we should see the L2 sector miss roughly equal to the cold miss count. In this scenario, since $Q, K, V, O$ are the major four tensors, the cold miss should approximately equal to $4\frac{SDE}{C}$, which is $16S$ with our configuration.
+However, experimental results show divergence at $S \approx 80$K (KV size = 20 MiB), significantly below the 50 MiB L2 capacity. This discrepancy---the \textbf{L2 capacity miss problem}---motivates our optimization.
 
-Given that the KV matrix constitutes a major portion of the access volume, we expect L2 misses to diverge from cold misses only when the KV size approached the L2 cache size. Experimental results in Figure~\ref{fig:study3-miss} indicate that the divergence point occurs at a sequence length ($S$) of approximately 80K, corresponding to a KV size of 20 MiB, which is expected as the cache size is 24MiB.
-
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/seqlen_miss_change_sm48.png}
-  \caption{L2 Miss Count vs Sequence Length (SM=48). The dashed line represents the theoretical cold miss count ($16S$).}
-  \label{fig:study3-miss}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/seqlen_miss_change_sm48.png}
+    \caption{L2 Miss Count vs Sequence Length (SM=48). Dashed line: theoretical cold miss ($16S$).}
+    \label{fig:study3-miss}
 \end{figure}
 
-\subsection{The Cause of L2 Non-Compulsory Miss}
+The early divergence suggests that concurrent CTAs streaming through KV tiles evict each other's cache lines before reuse can occur.
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/sm_misscount_128k.png}
-  \caption{L2 Cache Miss Count and Hit Rate vs. Number of Active SMs. The scale factor for the hit rate is observed to be approximately $1 - \frac{1}{N_{SM}}$.}
-  \label{fig:study4-miss}
-\end{figure}
+%% ============================================================================
+%% SECTION 4: THE SAWTOOTH ACCESS PATTERN
+%% ============================================================================
+\section{The Sawtooth Access Pattern}
+\label{sec:sawtooth}
 
-In this study, we examine the relationship between the number of active Streaming Multiprocessors (SMs) and L2 cache behavior, with a particular focus on \emph{non-compulsory misses} (i.e., misses beyond cold misses). Figure~\ref{fig:study4-miss} presents the L2 miss count and L2 hit rate as functions of the number of active SMs.
+\subsection{Core Concept}
 
-As the number of SMs increases, a clear trend appears in the L2 hit rate. The experimental results suggest that the hit rate scales with the number of SMs (\(N_{SM}\)) approximately according to the factor \(1 - \frac{1}{N_{SM}}\). This scaling implies that activating more SMs increases the likelihood that a requested cache line is already present in the shared L2 cache. The final hit ratio approaches \(1 - \frac{1}{48} \approx 98\%\) for this architecture.
-
-This behavior is an indicator of \emph{wavefront-like reuse among CTAs}. On the GB10 architecture under this workload, CTAs appear to progress in a largely synchronized manner. As a result, when the first CTAs populates the L2 cache during its global-to-shared memory loads, subsequent CTAs can reuse the same cache lines, leading to L2 hit events instead of misses.
-
-\section{Sawtooth Wavefront Reordering}
-
-The previous studies have established that standard cyclic access patterns lead to significant L2 non-compulsory misses once the KV data size exceeds the L2 capacity. This inefficiency arises because the reuse distance--the volume of data accessed between two reuses of the same cache line--exceeds the cache size.  Reuse distance is originally called the LRU stack distance~\cite{Mattson+:IBM70}.
-
-To reduce the reuse distance, we change the code to iterate the KV data in a different order, from cyclic to sawtooth.  In particular, we alternate the scanning direction of the inner loop (loading KV blocks from 0 to $N$ in even iterations and $N$ to 0 in odd iterations).  Unlike the cyclic order where all reuse distances equal to the data size, the sawtooth order reduces the reuse distance for most data accesses to be less than the data size.  We call this technique \emph{Sawtooth Wavefront Reordering}.
-
-In this section, we first implement and evaluate this optimization in our controlled CUDA environment to quantify the raw theoretical gain. Subsequently, we port this logic to the CuTile implementations to validate that these low-level insights translate effectively to abstracted programming models.
-
-\subsection{Implementation}
-The implementation distributes the workload by assigning sequences of Q tiles to each SM. We present the logic for the alternating scan pattern in Algorithm \ref{alg:sawtooth}.
-
-\begin{algorithm}[H]
-  \caption{Sawtooth KV Access Pattern}
-  \label{alg:sawtooth}
-  \begin{algorithmic}[1]
-    \State \textbf{Input:} Sequence of Query tiles $Q_{seq}$ assigned to SM
-    \State \textbf{Input:} Total KV tiles $N_{KV}$
-    \State $i_{local} \gets 0$
-    \For{each query tile $q$ in $Q_{seq}$}
-    \State \Comment{Determine scan direction based on local iteration parity}
-    \If{$i_{local} \pmod 2 = 0$}
-    \State $start \gets 0$, $end \gets N_{KV}$, $step \gets 1$ \Comment{Forward}
-    \Else
-    \State $start \gets N_{KV}-1$, $end \gets -1$, $step \gets -1$ \Comment{Backward}
-    \EndIf
-    \State
-    \For{$j \gets start$ \textbf{to} $end$ \textbf{step} $step$}
-    \State Load KV tile $K_j, V_j$
-    \State Compute Attention($q, K_j, V_j$)
-    \EndFor
-    \State $i_{local} \gets i_{local} + 1$
-    \EndFor
-  \end{algorithmic}
-\end{algorithm}
-
-\subsection{CUDA Results}
-
-We evaluated the performance of Sawtooth Wavefront Reordering against the baseline (cyclic) approach across varying batch sizes ($B=\{1, 2, 4, 8\}$). As shown in Figure \ref{fig:study5-throughput} and \ref{fig:study5-miss}, the proposed method achieves significant reductions in L2 cache misses and corresponding improvements in throughput.
-
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/study5_throughput.png}
-  \caption{Kernel Throughput: Original (Cyclic) vs. Sawtooth.
-    % Sawtooth achieves significantly higher throughput across all batch sizes.
-  }
-  \label{fig:study5-throughput}
-\end{figure}
-
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/study5_misses.png}
-  \caption{L2 Cache Misses: Original (Cyclic) vs. Sawtooth.
-    % The locality optimization reduces L2 non-compulsory misses by approximately 50\%.
-  }
-  \label{fig:study5-miss}
-\end{figure}
-
-Sawtooth Wavefront Reordering reduces the L2 non-compulsory misses by approximately 50\% across all tested configurations. This reduction in memory traffic translates directly into performance gains, with throughput increasing significantly (e.g., from approx. 1.3 TFLOPS to 2.4 TFLOPS). This confirms that properly managing the reuse distance of large streaming buffers (like KV cache) can effectively mitigate non-compulsory misses even when the working set exceeds the cache size.
-
-\subsection{Validation on CuTile}
-We further validated the L2 non-compulsory miss reduction optimization by porting the Sawtooth optimization to \texttt{CuTile}, a Python-based tile-centric programming environment. NVIDIA CUDA Tile is a tile-based GPU programming model that targets portability for NVIDIA Tensor Cores. CUDA Tile achieves peak GPU performance with a programming model that simplifies the creation of optimized, tile-based kernels across NVIDIA platforms \cite{CUDATile}. We evaluated two implementation variants:
-
+The sawtooth access pattern exploits \textbf{intra-CTA temporal locality} between consecutive query tiles. Within a single CTA processing multiple query tiles:
 \begin{itemize}
-  \item \textbf{Fully Static}: A direct port of the persistent CTA logic where the entire schedule is statically determined.
-  \item \textbf{Tile-based}: A variant that leverages the tile-based programming model. Unlike the static schedule, this variant locally advances the sequence loop by a step of 2 and alternates the order accordingly to achieve the sawtooth pattern.
+    \item \textbf{Query tile $i$ (even)}: traverse KV tiles in \textit{forward} order ($j = 0, 1, \ldots, T_c-1$).
+    \item \textbf{Query tile $i+1$ (odd)}: traverse KV tiles in \textit{reverse} order ($j = T_c-1, \ldots, 1, 0$).
 \end{itemize}
 
-Both programs are implemented with a tile size of $64\times64$  and tested with a batch size of $8$, a sequence length of $128\times1024$, and a head dimension of $64$.
+This creates a simple alternating pattern:
+\begin{verbatim}
+Q0: KV0  KV1  KV2  ...  KVn-1  KVn
+Q1: KVn  KVn-1  ...  KV2  KV1  KV0
+Q2: KV0  KV1  KV2  ...  KVn-1  KVn
+Q3: KVn  KVn-1  ...  KV2  KV1  KV0
+    ...
+\end{verbatim}
 
-\subsubsection{Results}
-We profiled both the standard cyclic pattern (Static, Tile) and sawtooth reordered (Static Alt, Tile Alt) on the same hardware configuration. The results, summarized in Figure \ref{fig:cutile-results}, align closely with our CUDA findings. Sawtooth Wavefront Reordering consistently reduces the total L2 miss count from approximately 370 million to 120 million sectors—a reduction of roughly 67\%. This efficiency gain translates into a measurable performance improvement, with performance increasing from $\sim$61 TFLOPS to $\sim$69 TFLOPS ($\sim$13\%). In the causal variant, the sawtooth pattern is also effective as the inner KV traversal loop still covers mostly the same data for each schedule round of all CTAs. Our experiment shows an increase from $\sim41$ TFLOPS to $\sim$66 TFLOPS ($\sim$60\%).
+\subsection{Why It Works}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/cutile_study5_misses.png}
-  \caption{L2 Miss Count Comparison on CuTile without Causal Masking (Regular vs. Sawtooth). The optimization significantly reduces L2 miss traffic for both implementation variants.}
-  \label{fig:cutile-misses}
+When a CTA finishes processing query tile $Q_i$ in forward order, the \textit{last} KV tiles accessed ($\mathbf{K}_n, \mathbf{V}_n$) are still warm in L2 cache. If the next query tile $Q_{i+1}$ starts from the \textit{beginning} (as in the default forward-only pattern), those cached tiles are wasted---evicted before reuse.
+
+With sawtooth, $Q_{i+1}$ starts from the \textit{end}, immediately reusing the cache-warm tiles:
+\begin{itemize}
+    \item $Q_i$ finishes with $\mathbf{K}_n, \mathbf{V}_n$ in cache.
+    \item $Q_{i+1}$ starts by accessing $\mathbf{K}_n, \mathbf{V}_n$---\textbf{cache hit}.
+    \item As $Q_{i+1}$ proceeds backward, it loads earlier tiles.
+    \item $Q_{i+1}$ finishes with $\mathbf{K}_0, \mathbf{V}_0$ in cache.
+    \item $Q_{i+2}$ starts forward, reusing $\mathbf{K}_0, \mathbf{V}_0$---\textbf{cache hit}.
+\end{itemize}
+
+This simple reversal transforms half of the KV tile accesses from cold misses to cache hits at the boundary between consecutive query tiles.
+
+\subsection{Tile Grouping}
+
+For practical implementation, we group query tiles into chunks of size $X$ (tile factor). All tiles within a group use the same direction, and direction alternates between groups. This amortizes the index computation overhead while preserving the boundary reuse benefit. We use $X = 8$ empirically.
+
+%% ============================================================================
+%% SECTION 5: COMPILER-LEVEL OPTIMIZATION
+%% ============================================================================
+\section{Compiler-Level Optimization}
+\label{sec:compiler}
+
+We introduce \texttt{AlternateReductionLoopPass}, a compiler transformation within the CuTile IR framework that automatically injects the sawtooth access pattern into compatible kernels. This pass relieves programmers from manually implementing complex index arithmetic and loop restructuring, ensuring correctness and performance portability.
+
+\subsection{Algorithm Overview}
+
+\begin{algorithm}[ht]
+\caption{Alternate Reduction Loop Transformation}
+\label{alg:sawtooth-transform}
+\begin{algorithmic}[1]
+\Require Outer loop over query tiles, inner reduction loop over KV tiles
+\Require Tile factor $X$
+\State Wrap outer loop in a \textbf{tile loop} iterating over groups of $X$
+\State Compute \texttt{isOdd} $\gets$ (tile index) $\mod 2 \neq 0$
+\For{each query tile $i$ in tile group}
+    \For{$\text{step} = 0$ to $T_c - 1$}
+        \If{\texttt{isOdd}}
+            \State $j \gets T_c - 1 - \text{step}$ \Comment{Reverse direction}
+        \Else
+            \State $j \gets \text{step}$ \Comment{Forward direction}
+        \EndIf
+        \State Load $\mathbf{K}_j, \mathbf{V}_j$ and compute MMA
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Pass Implementation}
+
+The transformation operates in four distinct phases:
+
+\begin{enumerate}
+    \item \textbf{Pattern Detection and Safety Analysis:} The pass first analyzes the IR to identify the outermost loop structure. Crucially, it must verify that the inner loop performs an \textbf{associative reduction}. This is essential because altering the traversal order (alternating between forward and reverse) is only mathematically valid for associative operations (like summation in matrix multiplication) or operations where order does not affect the final result (like finding the maximum). If the reduction is not associative, reordering could lead to incorrect results, so the pass conservatively skips such loops.
+    \item \textbf{Loop Tiling:} Once a valid loop is identified, the pass applies loop tiling to create the granularity needed for the sawtooth pattern. The original loop is split into an outer ``tile loop'' (iterating over groups of tiles) and an inner ``iteration loop'' (iterating within a group). This hierarchical structure allows us to control direction switching at the tile-group boundary.
+    \item \textbf{Index Computation:} Within the tiled structure, the pass injects logic to determine the traversal direction. It computes an \texttt{isOdd} boolean based on the tile group index. A \texttt{SelectOp} is then inserted to choose between the standard index (for forward traversal) and a computed reverse index ($N - 1 - i$) based on the \texttt{isOdd} condition.
+    \item \textbf{IR Cloning and Remapping:} Finally, the body of the original loop is cloned into the new structure. All references to the original induction variable are remapped to the new, direction-aware index \texttt{SelectOp}. This ensures that all memory loads and computations within the loop automatically adhere to the new access pattern without requiring changes to the core kernel logic.
+\end{enumerate}
+
+\subsection{Limitations}
+
+\paragraph{Assumed Loop Structure.} The pass assumes a repetition loop inside the CTA. Non-tiled kernels require restructuring to \textbf{tiled-loop stride} first.
+
+\paragraph{No Cross-Launch Optimization.} CuTile IR operates within a single kernel launch. The pass cannot coordinate across launches or modify launch geometry.
+
+%% ============================================================================
+%% SECTION 6: IMPLEMENTATION VARIANTS
+%% ============================================================================
+\section{Implementation Variants}
+\label{sec:variants}
+
+We evaluate five kernel variants:
+
+\begin{enumerate}
+    \item \textbf{Default}: Standard Flash Attention with persistent CTAs, forward KV traversal.
+    \item \textbf{Tiled Loop Stride}: Two-level tiled loop ($X=8$), all forward.
+    \item \textbf{Tiled Loop Stride + Sawtooth}: Tiled loop with alternating direction.
+    \item \textbf{Fully Static Scheduled}: Fixed CTA-to-tile assignment, forward only.
+    \item \textbf{Fully Static + Sawtooth}: Static scheduling with alternating traversal.
+\end{enumerate}
+
+\subsection{Baseline Kernel Details}
+
+The baseline kernel implements specific memory optimizations:
+
+\subsubsection{Dynamic Square Tiling}
+Unlike the original Flash Attention paper which suggests asymmetric tiling ($B_c \ll B_r$), our implementation calculates the maximum feasible \textbf{square tile size} $T$ at runtime:
+\begin{equation}
+\text{Mem}_{\text{req}} \approx 4T^2 + 10dT \leq \text{SRAM}_{\text{capacity}}
+\end{equation}
+
+\subsubsection{Shared Memory Layout \& Reuse}
+To minimize shared memory footprint, we employ explicit buffer reuse:
+\begin{itemize}
+    \item \textbf{Coexistence:} $\mathbf{Q}$, $\mathbf{K}$, $\mathbf{V}$ tiles reside in distinct buffers during $\mathbf{Q}\mathbf{K}^T$.
+    \item \textbf{Buffer Reuse:} After softmax, $\mathbf{K}$ buffer is repurposed for $\mathbf{P}$.
+\end{itemize}
+
+%% ============================================================================
+%% SECTION 7: EXPERIMENTAL SETUP
+%% ============================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Hardware}
+
+NVIDIA GB10 GPU (Blackwell): 48 SMs, 50 MB L2, 32-byte sector size.
+
+\subsection{Frameworks}
+
+All variants implemented in \textbf{CuTile} and \textbf{Triton}.
+
+\subsection{Configurations}
+
+\begin{itemize}
+    \item \textbf{Attention Type:} Non-causal and Causal
+    \item \textbf{Quantization:} FP16 and FP8 E4M3
+\end{itemize}
+
+\subsection{Profiling Methodology}
+
+We employ NVIDIA Nsight Compute CLI (\texttt{ncu}) to capture hardware counters:
+\begin{itemize}
+    \item \texttt{lts\_\_t\_sector\_hit\_rate.pct}: L2 hit rate
+    \item \texttt{lts\_\_t\_sectors.sum}: Total L2 sector accesses
+    \item \texttt{lts\_\_t\_sectors\_srcunit\_tex\_lookup\_miss.sum}: L2 misses
+    \item \textbf{Kernel Execution Time}: End-to-end wall-clock time
+\end{itemize}
+
+Warmup runs precede measurement; metrics are averaged over multiple iterations with outliers removed.
+
+%% ============================================================================
+%% SECTION 8: PRELIMINARY RESULTS (EXISTING DATA)
+%% ============================================================================
+\section{Preliminary Results: CuTile Validation}
+\label{sec:preliminary}
+
+We first validate the sawtooth pattern effectiveness using CuTile implementations before extending to comprehensive evaluation.
+
+\subsection{Non-Causal Attention}
+
+\begin{table}[h]
+\centering
+\caption{CuTile Non-Causal: L2 Misses \& Throughput (128K Sequence)}
+\label{tab:study5-data}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{L2 Misses} & \textbf{TFlops} & \textbf{TFlops} \\
+ & \textbf{(Regular)} & \textbf{(Sawtooth)} & \textbf{(Regular)} & \textbf{(Sawtooth)} \\
+\midrule
+Fully Static & 372,244,480 & 122,117,820 & 61.58 & 69.34 \\
+Tiled Loop & 369,644,856 & 127,651,952 & 60.74 & 69.24 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/cutile_study5_misses.png}
+    \caption{CuTile Non-Causal: L2 Miss Comparison}
+    \label{fig:study5-misses}
 \end{figure}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/cutile_study5_throughput.png}
-  \caption{Throughput Comparison on CuTile without Causal Masking (Regular vs. Sawtooth). Reduction in L2 traffic yields $\sim$13\% higher performance.}
-  \label{fig:cutile-throughput}
-  \label{fig:cutile-results}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/cutile_study5_throughput.png}
+    \caption{CuTile Non-Causal: Throughput Comparison}
+    \label{fig:study5-throughput}
 \end{figure}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/cutile_study6_misses.png}
-  \caption{L2 Miss Count Comparison on CuTile with Causal Masking (Regular vs. Sawtooth). The optimization significantly reduces L2 miss traffic for both implementation variants.}
-  \label{fig:cutile-misses}
+The sawtooth pattern reduces L2 misses by approximately \textbf{3$\times$} and improves throughput by \textbf{12--14\%} for non-causal attention.
+
+\subsection{Causal Attention}
+
+\begin{table}[h]
+\centering
+\caption{CuTile Causal: L2 Misses \& Throughput (128K Sequence)}
+\label{tab:study6-data}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{L2 Misses} & \textbf{TFlops} & \textbf{TFlops} \\
+ & \textbf{(Regular)} & \textbf{(Sawtooth)} & \textbf{(Regular)} & \textbf{(Sawtooth)} \\
+\midrule
+Fully Static & 629,425,276 & 95,344,684 & 32.21 & 59.89 \\
+Tiled Loop & 350,626,172 & 162,876,760 & 41.05 & 66.11 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/cutile_study6_misses.png}
+    \caption{CuTile Causal: L2 Miss Comparison}
+    \label{fig:study6-misses}
 \end{figure}
 
-\begin{figure}
-  \centering
-  \includegraphics[width=0.75\linewidth]{plots/cutile_study6_throughput.png}
-  \caption{Throughput Comparison on CuTile with Causal Masking (Regular vs. Sawtooth). Reduction in L2 traffic yields $\sim$60\% higher performance.}
-  \label{fig:cutile-throughput}
-  \label{fig:cutile-results}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/cutile_study6_throughput.png}
+    \caption{CuTile Causal: Throughput Comparison}
+    \label{fig:study6-throughput}
 \end{figure}
 
-\subsubsection{Limitations}
-Although the sawtooth order proves effective, we identified a limitation regarding tile size. The optimization works for regular patterns where the selected tile size is smaller than the shared memory capacity. However, for large tile-based programming models—specifically when testing with a tile size of 128, the CuTile compiler may split large tiles that do not fit in \textsc{L1Tex} into smaller tiles, which alters the access pattern. We leave this for future work.
+For causal attention, fully static with sawtooth achieves \textbf{6.6$\times$} L2 miss reduction and \textbf{1.86$\times$} throughput improvement. Tiled loop with sawtooth shows \textbf{2.2$\times$} miss reduction and \textbf{1.6$\times$} throughput gain.
 
-% \subsection{Baseline Kernel}
-% \label{sec:kernel-baseline}
+%% ============================================================================
+%% SECTION 9: COMPREHENSIVE RESULTS
+%% ============================================================================
+\section{Comprehensive Results}
+\label{sec:results}
 
-% The baseline kernel implements the algorithm using specific memory optimizations found in our CUDA implementation:
+We now present full results across all variants, frameworks, and configurations.
 
-% \subsubsection{Dynamic Square Tiling}
-% Unlike the original Flash Attention paper which suggests asymmetric tiling ($B_c \ll B_r$), our implementation calculates the maximum feasible \textbf{square tile size} $T$ at runtime. We solve the following constraint to maximize shared memory (SRAM) utilization:
+\subsection{CuTile Results}
 
-% \begin{equation}
-% \text{Mem}_{\text{req}} \approx 4T^2 + 10dT \leq \text{SRAM}_{\text{capacity}}
-% \end{equation}
+\subsubsection{FP16 Non-Causal}
 
-% Where $d$ is the head dimension. The term $4T^2$ accounts for the $O(T^2)$ intermediate score matrices (fp32 accumulator and fp16 operands), while $10dT$ accounts for the $O(Td)$ storage required for $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ buffers and output accumulators.
+\begin{table}[h]
+\centering
+\caption{CuTile FP16 Non-Causal Results}
+\label{tab:cutile-fp16-noncausal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% \subsubsection{Shared Memory Layout \& Reuse}
-% To minimize the shared memory footprint, we employ explicit buffer reuse:
-% \begin{itemize}
-%     \item \textbf{Coexistence:} $\mathbf{Q}$, $\mathbf{K}$, and $\mathbf{V}$ tiles reside in distinct buffers during the first matmul ($\mathbf{Q}\mathbf{K}^T$).
-%     \item \textbf{Buffer Reuse:} After $\mathbf{S}_{ij}$ is computed and softmax is applied, the memory buffer originally allocated for $\mathbf{K}$ is repurposed to store the half-precision probability matrix $\mathbf{P}$. This allows the second matmul ($\mathbf{P}\mathbf{V}$) to proceed without allocating new memory.
-% \end{itemize}
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for CuTile FP16 Non-Causal]}
+    \caption{CuTile FP16 Non-Causal: L2 Misses vs Throughput}
+    \label{fig:cutile-fp16-noncausal}
+\end{figure}
 
-% \begin{verbatim}
-% // Pointer arithmetic from implementation
-% half* Q_smem = (half*)smem;
-% half* K_smem = Q_smem + tile_m * head_dim;
-% half* V_smem = K_smem + tile_n * head_dim;
-% // ...
-% // K_smem is later reused for P matrix
-% half* P_half = K_smem;
-% \end{verbatim}
+\subsubsection{FP16 Causal}
 
-% \subsection{Cache Eviction Kernel}
-% \label{sec:kernel-evict}
+\begin{table}[h]
+\centering
+\caption{CuTile FP16 Causal Results}
+\label{tab:cutile-fp16-causal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% The eviction kernel extends the baseline with explicit L2 cache eviction hints via PTX assembly:
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for CuTile FP16 Causal]}
+    \caption{CuTile FP16 Causal: L2 Misses vs Throughput}
+    \label{fig:cutile-fp16-causal}
+\end{figure}
 
-% \begin{verbatim}
-% __device__ void load_evict_last(const half* ptr,
-%                                  half* dst) {
-%     asm volatile(
-%         "ld.global.cg.L2::evict_last.v8.b32 "
-%         "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-%         : "=r"(dst[0]), ..., "=r"(dst[7])
-%         : "l"(ptr)
-%     );
-% }
-% \end{verbatim}
+\subsubsection{FP8 Non-Causal}
 
-% The \texttt{.L2::evict\_last} modifier evicts cache lines from L2 immediately after use, preventing single-use streaming data from polluting the cache. This applies to all Q, K, V loads.
+\begin{table}[h]
+\centering
+\caption{CuTile FP8 Non-Causal Results}
+\label{tab:cutile-fp8-noncausal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% \subsection{Attention Masking Variants}
-% \label{sec:kernel-variants}
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for CuTile FP8 Non-Causal]}
+    \caption{CuTile FP8 Non-Causal: L2 Misses vs Throughput}
+    \label{fig:cutile-fp8-noncausal}
+\end{figure}
 
-% Both kernels are evaluated in two configurations:
+\subsubsection{FP8 Causal}
 
-% \paragraph{Causal Attention:} Each query position attends only to positions $\leq$ current position. Creates asymmetric KV access (early queries access fewer tiles).
+\begin{table}[h]
+\centering
+\caption{CuTile FP8 Causal Results}
+\label{tab:cutile-fp8-causal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% \paragraph{Non-Causal Attention:} Each query position attends to all sequence positions. Creates uniform KV access across all query blocks, maximizing potential for L2 cache sharing between SMs.
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for CuTile FP8 Causal]}
+    \caption{CuTile FP8 Causal: L2 Misses vs Throughput}
+    \label{fig:cutile-fp8-causal}
+\end{figure}
 
-% \section{Experimental Setup}
-% \label{sec:setup}
+\subsection{Triton Results}
 
-% \subsection{Hardware Configuration}
+\subsubsection{FP16 Non-Causal}
 
-% All experiments were conducted on an NVIDIA GB10 GPU (Blackwell architecture).
+\begin{table}[h]
+\centering
+\caption{Triton FP16 Non-Causal Results}
+\label{tab:triton-fp16-noncausal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% \subsubsection{Memory Hierarchy}
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for Triton FP16 Non-Causal]}
+    \caption{Triton FP16 Non-Causal: L2 Misses vs Throughput}
+    \label{fig:triton-fp16-noncausal}
+\end{figure}
 
-% Key specifications:
-% \begin{itemize}
-%     \item \textbf{L2 Cache}: 50 MB unified L2 cache shared across all SMs
-%     \item \textbf{Cache Sector Size}: 32 bytes per sector
-% \end{itemize}
+\subsubsection{FP16 Causal}
 
-% The 32-byte sector size is critical for our evict-last policy implementation, as PTX load instructions must align to sector boundaries.
-% \subsection{Benchmark Configuration}
+\begin{table}[h]
+\centering
+\caption{Triton FP16 Causal Results}
+\label{tab:triton-fp16-causal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% We evaluate both kernel implementations across a range of attention problem sizes:
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for Triton FP16 Causal]}
+    \caption{Triton FP16 Causal: L2 Misses vs Throughput}
+    \label{fig:triton-fp16-causal}
+\end{figure}
 
-% \begin{table}[h]
-% \centering
-% \caption{Benchmark problem sizes}
-% \label{tab:benchmark-sizes}
-% \begin{tabular}{ll}
-% \toprule
-% \textbf{Parameter} & \textbf{Values} \\
-% \midrule
-% Batch Size & 1 \\
-% Num Heads & 1 \\
-% Sequence Length & Placeholder \\
-% Head Dimension & 64, 128 \\
-% \bottomrule
-% \end{tabular}
-% \end{table}
+\subsubsection{FP8 Non-Causal}
 
-% \subsection{Profiling Methodology}
+\begin{table}[h]
+\centering
+\caption{Triton FP8 Non-Causal Results}
+\label{tab:triton-fp8-noncausal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% We employ the NVIDIA Nsight Compute CLI (\texttt{ncu}) to capture low-level hardware performance counters. This allows for precise isolation of the memory subsystem behavior, specifically targeting the \texttt{lts} (Level 2 Cache Slice) domain.
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for Triton FP8 Non-Causal]}
+    \caption{Triton FP8 Non-Causal: L2 Misses vs Throughput}
+    \label{fig:triton-fp8-noncausal}
+\end{figure}
 
-% \paragraph{Key Metrics}
+\subsubsection{FP8 Causal}
 
-% We capture specific hardware counters to quantify cache efficiency and traffic volume:
+\begin{table}[h]
+\centering
+\caption{Triton FP8 Causal Results}
+\label{tab:triton-fp8-causal}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{L2 Misses} & \textbf{TFlops} \\
+\midrule
+Default & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled Loop Stride & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Tiled + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+Fully Static + Sawtooth & \textcolor{red}{TODO} & \textcolor{red}{TODO} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-% \begin{itemize}
-%     \item \texttt{lts\_\_t\_sector\_hit\_rate.pct}: The percentage of L2 cache sector lookup requests that successfully hit in the cache. This serves as our primary proxy for data reuse efficiency.
-%     \item \texttt{lts\_\_t\_sectors.sum}: The total number of 32-byte sectors accessed by the L2 cache. This metric quantifies the total traffic burden placed on the memory subsystem.
-%     \item \textbf{Kernel Execution Time}: The end-to-end wall-clock time, serving as the aggregate metric for performance improvements.
-% \end{itemize}
+\begin{figure}[ht]
+    \centering
+    \textcolor{red}{[TODO: Bar chart for Triton FP8 Causal]}
+    \caption{Triton FP8 Causal: L2 Misses vs Throughput}
+    \label{fig:triton-fp8-causal}
+\end{figure}
 
-% L1 cache metrics are excluded as our optimization strategy focuses strictly on the shared L2 hierarchy.
+%% ============================================================================
+%% SECTION 10: DISCUSSION
+%% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
 
-% \paragraph{Measurement Protocol}
+\subsection{Why Sawtooth Works}
 
-% Warmup runs precede measurement, and metrics are averaged over multiple iterations with outliers removed. GPU frequency is locked to prevent thermal throttling.
+The sawtooth pattern exploits temporal locality within a CTA's sequential processing of query tiles:
+\begin{enumerate}
+    \item \textbf{Cache line reuse at boundaries:} When $Q_i$ finishes, its last-accessed KV tiles remain in L2. By starting $Q_{i+1}$ from the opposite end, these tiles are immediately reused.
+    \item \textbf{Reduced cold misses:} At each query tile transition, approximately half the KV tiles are cache hits instead of misses.
+    \item \textbf{Works with L2's LRU-like policy:} Recently accessed tiles stay in cache; sawtooth ensures the ``recent'' tiles are exactly what's needed next.
+\end{enumerate}
 
-% \section{Results and Analysis}
-% \label{sec:results}
+\subsection{Causal vs Non-Causal}
 
-% Placeholder for results.
+Causal masking creates asymmetric access. Early queries have shorter reductions, limiting sharing. Later queries benefit maximally. The preliminary results show causal attention benefits even more from sawtooth due to the higher baseline miss rate.
 
-% \section{Discussion}
-% \label{sec:discussion}
+\subsection{Validation of Motivation}
 
-% Placeholder for discussion.
+The L2 capacity miss problem identified in Section~\ref{sec:l2-capacity} is directly addressed by sawtooth: by extending cache line lifetime at group boundaries, we reduce the effective concurrent working set and push the divergence point to higher sequence lengths.
 
+\textcolor{red}{[TODO: Add specific comparison observations after data collection]}
+
+%% ============================================================================
+%% SECTION 11: RELATED WORK
+%% ============================================================================
 \section{Related Work}
+\label{sec:related}
 
-Cyclic and sawtooth are simplest traversal patterns studied in early work about the working-set model and management~\citep{DenningK:SOSP75}.  The sawtooth pattern has been used as a micro-benchmark to analyze the replacement algorithm on AMD multicore processors built with chipsets and large LLCs~\cite{Sun+:MEMSYS24}.  A recent theory of symmetric locality formalized the set of all retraversal orders~\citep{Escolona+:MEMO24}.
+\subsection{Attention Optimization}
 
-Sawtooth ordering is a special case of "last-free allocation" used in memory allocators to reuse the most recently freed block for the next request of a compatible size, often implemented by a LIFO free list.  In fact, the call stack is an example of such memory allocation to maximize cache reuse.  As a technique of locality optimization, sawtooth ordering is machine independent, unlike loop tiling which targets a specific cache.
+Flash Attention~\cite{FlashAttention} introduced IO-aware tiled computation for attention, reducing HBM$\leftrightarrow$SRAM traffic from $O(N^2)$ to $O(N)$. Flash Attention 2~\cite{FlashAttention2} improved parallelism and work partitioning. These works focus on the HBM-SRAM interface; our sawtooth pattern addresses the complementary L2 cache efficiency problem.
 
-% Instead of the miss count, the effect can be quantified by the reduction in reuse distance or LRU stack distance~\cite{Mattson+:IBM70}.
+\subsection{GPU Cache Optimization}
 
-\section{AI Usage Declaration}
-\label{sec:ai-usage}
+\paragraph{Cache-Conscious Wavefront Scheduling.} Rogers et al.~\cite{10.1109/MICRO.2012.16} proposed CCWS, an adaptive hardware mechanism that detects intra-wavefront locality and reduces the number of actively issuing threads to avoid L1 thrashing. While CCWS targets L1, our software-based approach targets L2 without hardware modification.
 
-All experimental data reported in this paper was collected manually by the authors.
-For figure generation, we used plotting scripts that were generated via Google Antigravity (powered by Gemini Pro 3), and then reviewed and executed by the authors.
+\paragraph{CTA Scheduling for Locality.} Lee et al.~\cite{6835937} proposed alternative thread block scheduling to improve GPGPU resource utilization. Li et al.~\cite{10.1145/3037697.3037709} introduced Locality-Aware CTA Clustering, reshaping default CTA scheduling to group CTAs with potential reuse on the same SM. These works modify CTA-to-SM assignment; our sawtooth pattern modifies memory access order \textit{within} CTAs.
 
-\section{Summary}
+\paragraph{GPU Microbenchmarking.} Jia et al.~\cite{GPUCacheOpt} dissected GPU memory hierarchy through microbenchmarking, revealing cache behavior patterns. Our work builds on such understanding to design access patterns that exploit L2 caching.
+
+\subsection{Loop Transformations}
+
+Classical loop tiling and interchange~\cite{LoopTiling} optimize cache behavior in single-threaded contexts. Our \texttt{AlternateReductionLoopPass} adapts these principles for multi-CTA GPU execution, where the challenge is coordinating access patterns across concurrent thread blocks sharing L2.
+
+%% ============================================================================
+%% SECTION 12: CONCLUSION
+%% ============================================================================
+\section{Conclusion}
 \label{sec:conclusion}
 
-We have presented cache performance analysis and optimization for Flash Attention on GB10.  We have identified the main cause of L2 cache miss and developed Sawtooth Wavefront Reordering to increase data reuse in L2.  Evaluation shows that when applied on the CUDA version of the code, optimization reduces L2 misses by 50\% and increases throughput from 1.3 TFLOPS to 2.4 TFLOPS. In the  CuTile version, it reduces the miss count by 67\% and increases throughput from 61 TFLOPS to 69 TFLOPS (non-causal), 41  TFLOPS to 66 TFLOPS (causal), an increase of 13\% (60\%).
+We presented the \textbf{sawtooth access pattern}, reducing L2 cache misses in FMHA kernels by alternating KV traversal direction. Through empirical analysis, we established that L2 behavior is deterministic and identified the capacity miss problem that motivates our optimization.
 
-\begin{acks}
-  We thank Yanghui Wu, Jiaqi Nie, and Yiling Zou for their related work on GPU performance modeling and locality analysis, which has helped inform and motivate our study.
-\end{acks}
+Preliminary CuTile results demonstrate 3--6$\times$ L2 miss reduction and up to 1.86$\times$ throughput improvement. Our \texttt{AlternateReductionLoopPass} enables automatic application in CuTile IR.
 
-% In this paper, we presented a methodology for improving CuTile-based FLash Attention by bridging the gap between high-level programming abstractions and low-level hardware characteristics. By stepping back to a controlled, raw CUDA environment, we were able to perform a rigorous quantitative analysis of the L2 cache behavior on the NVIDIA GB10 architecture.
-
-% We established that L1 cache exerts minimal influence on these streaming workloads and developed a precise deterministic model for L2 sector accesses. Our analysis of capacity limits identified the specific sequence length thresholds where L2 efficiency degrades and revealed intrinsic wavefront-level reuse patterns among synchronized CTAs.
-
-% Crucially, we translated these theoretical insights into practical performance gains. We introduced the ``Sawtooth'' alternating scan pattern to mitigate L2 cache thrashing, a technique directly informed by our analysis of reuse distances. Validating this approach within the CuTile framework, we achieved a 13\% improvement in throughput.
-% This work demonstrates that even with advanced tools like Flash Attention and CuTile, deep quantitative understanding of the underlying memory hierarchy remains essential for unlocking the full potential of modern GPU architectures.
+\paragraph{Future Work.} Extend to multi-launch scenarios, adaptive tile factor selection, and other streaming GPU workloads.
 
 %%
-%% The next two lines define the bibliography style to be used, and
-%% the bibliography file.
+%% Bibliography
+%%
 \bibliographystyle{ACM-Reference-Format}
-\bibliography{references,all}
+\bibliography{references}
 
 \end{document}

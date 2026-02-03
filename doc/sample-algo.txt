@@ -1,0 +1,313 @@
+//===- AlternateReductionLoop.cpp - Alternate Reduction Loop Pass -*- C++ -*-===//
+//
+// Part of the CUDA Tile IR project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Visitors.h"
+#include "mlir/Pass/Pass.h"
+
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/DenseMap.h"
+
+#include "cuda_tile/Dialect/CudaTile/IR/Attributes.h"
+#include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
+#include "cuda_tile/Dialect/CudaTile/IR/Types.h"
+#include "cuda_tile/Dialect/CudaTile/Transforms/Passes.h"
+
+using namespace mlir;
+using namespace mlir::cuda_tile;
+
+namespace mlir::cuda_tile {
+
+/// Check if a ForOp contains MMA operations.
+static bool isMmaReductionLoop(ForOp forOp) {
+  bool hasMma = false;
+  bool hasIterValues = forOp.getNumRegionIterVars() > 0;
+
+  forOp.getBody()->walk([&](Operation *op) {
+    if (isa<MmaFOp, MmaIOp>(op))
+      hasMma = true;
+  });
+
+  return hasIterValues && hasMma;
+}
+
+/// Check if a ForOp has any nested ForOps.
+static bool hasNestedForOps(ForOp forOp) {
+  bool hasNested = false;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (isa<ForOp>(&op)) {
+      hasNested = true;
+      break;
+    }
+    op.walk([&](ForOp) {
+      hasNested = true;
+      return WalkResult::interrupt();
+    });
+    if (hasNested)
+      break;
+  }
+  return hasNested;
+}
+
+/// Find the FIRST (outermost) outer loop that has MMA reduction children.
+static ForOp findOutermostLoopWithMmaReductions(Operation *root) {
+  ForOp result = nullptr;
+  
+  root->walk<WalkOrder::PreOrder>([&](ForOp outerCandidate) -> WalkResult {
+    bool hasValidInnerLoop = false;
+    for (Operation &op : outerCandidate.getBody()->without_terminator()) {
+      if (auto innerCandidate = dyn_cast<ForOp>(&op)) {
+        if (isMmaReductionLoop(innerCandidate) && !hasNestedForOps(innerCandidate)) {
+          hasValidInnerLoop = true;
+          break;
+        }
+      }
+    }
+    if (hasValidInnerLoop) {
+      result = outerCandidate;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  
+  return result;
+}
+
+/// Struct to capture all info about an inner loop BEFORE transformation starts.
+struct InnerLoopInfo {
+  Operation *op;
+  Value lb;
+  Value ub;
+  Value step;
+  SmallVector<Value> initValues;
+  Value inductionVar;
+  SmallVector<Value> regionIterValues;
+  SmallVector<Operation *> bodyOps;
+  SmallVector<Value> continueOperands;
+  SmallVector<Value> results;
+};
+
+/// Transform the outer loop.
+static void transformOuterLoop(RewriterBase &rewriter, ForOp outerLoop,
+                                int tileXFactor) {
+  Location loc = outerLoop.getLoc();
+  
+  // Capture ALL values from original IR BEFORE any transformation
+  Value outerLb = outerLoop.getLowerBound();
+  Value outerUb = outerLoop.getUpperBound();
+  Value outerStep = outerLoop.getStep();
+  SmallVector<Value> outerInitValues(outerLoop.getInitValues());
+  Value outerInductionVar = outerLoop.getInductionVar();
+  SmallVector<Value> outerRegionIterValues(outerLoop.getRegionIterValues());
+  
+  // Capture outer loop continue operands
+  auto outerContinueOp = cast<ContinueOp>(outerLoop.getBody()->getTerminator());
+  SmallVector<Value> outerContinueOperands(outerContinueOp.getOperands());
+
+  // Collect all outer body operations and identify MMA reduction loops
+  SmallVector<Operation *> outerBodyOps;
+  llvm::DenseMap<Operation *, InnerLoopInfo> innerLoopInfos;
+  
+  for (Operation &op : outerLoop.getBody()->without_terminator()) {
+    outerBodyOps.push_back(&op);
+    if (auto forOp = dyn_cast<ForOp>(&op)) {
+      if (isMmaReductionLoop(forOp) && !hasNestedForOps(forOp)) {
+        InnerLoopInfo info;
+        info.op = &op;
+        info.lb = forOp.getLowerBound();
+        info.ub = forOp.getUpperBound();
+        info.step = forOp.getStep();
+        info.initValues = SmallVector<Value>(forOp.getInitValues());
+        info.inductionVar = forOp.getInductionVar();
+        info.regionIterValues = SmallVector<Value>(forOp.getRegionIterValues());
+        info.results = SmallVector<Value>(forOp.getResults());
+        
+        for (Operation &innerOp : forOp.getBody()->without_terminator())
+          info.bodyOps.push_back(&innerOp);
+        
+        auto innerContinue = cast<ContinueOp>(forOp.getBody()->getTerminator());
+        info.continueOperands = SmallVector<Value>(innerContinue.getOperands());
+        
+        innerLoopInfos[&op] = std::move(info);
+      }
+    }
+  }
+
+  // Get type info
+  TileType ivType = llvm::cast<TileType>(outerLb.getType());
+  Type elemType = ivType.getElementType();
+  auto intType = llvm::dyn_cast<IntegerType>(elemType);
+  if (!intType)
+    return;
+
+  TileType scalarIntType = TileType::get({}, intType);
+  auto createIntConst = [&](int64_t val) -> Value {
+    llvm::APInt apVal(intType.getWidth(), val);
+    auto constAttr = DenseIntElementsAttr::get(scalarIntType, apVal);
+    return rewriter.create<ConstantOp>(loc, scalarIntType, constAttr);
+  };
+
+  Value zero = createIntConst(0);
+  Value one = createIntConst(1);
+  Value two = createIntConst(2);
+  Value tileX = createIntConst(tileXFactor);
+
+  rewriter.setInsertionPoint(outerLoop);
+
+  Value tileStride = rewriter.create<MulIOp>(loc, tileX, outerStep);
+  Value outerRange = rewriter.create<SubIOp>(loc, outerUb, outerLb);
+  Value tileStrideMinus1 = rewriter.create<SubIOp>(loc, tileStride, one);
+  Value rangeRoundUp = rewriter.create<AddIOp>(loc, outerRange, tileStrideMinus1);
+  Value numTiles =
+      rewriter.create<DivIOp>(loc, rangeRoundUp, tileStride, Signedness::Signed);
+
+  // Create tile loop
+  auto tileLoop = rewriter.create<ForOp>(loc, zero, numTiles, one, outerInitValues);
+  Block *tileBody = tileLoop.getBody();
+  rewriter.setInsertionPointToStart(tileBody);
+  Value tileIdx = tileLoop.getInductionVar();
+  ValueRange tileIterArgs = tileLoop.getRegionIterValues();
+
+  Value tileOffset = rewriter.create<MulIOp>(loc, tileIdx, tileStride);
+  Value tileStart = rewriter.create<AddIOp>(loc, outerLb, tileOffset);
+
+  Value tileEndCandidate = rewriter.create<AddIOp>(loc, tileStart, tileStride);
+  Value tileEndCmp = rewriter.create<CmpIOp>(
+      loc, ComparisonPredicate::LESS_THAN, tileEndCandidate, outerUb,
+      Signedness::Signed);
+  Value tileEnd = rewriter.create<SelectOp>(loc, tileEndCmp,
+                                             tileEndCandidate, outerUb);
+
+  Value remainder = rewriter.create<RemIOp>(loc, tileIdx, two, Signedness::Signed);
+  Value isOdd = rewriter.create<CmpIOp>(
+      loc, ComparisonPredicate::NOT_EQUAL, remainder, zero,
+      Signedness::Signed);
+
+  Value tileRange = rewriter.create<SubIOp>(loc, tileEnd, tileStart);
+  Value numOuterIters =
+      rewriter.create<DivIOp>(loc, tileRange, outerStep, Signedness::Signed);
+
+  auto outerIterLoop = rewriter.create<ForOp>(loc, zero, numOuterIters, one, 
+                                               SmallVector<Value>(tileIterArgs));
+  Block *outerIterBody = outerIterLoop.getBody();
+  rewriter.setInsertionPointToStart(outerIterBody);
+  Value outerIdx = outerIterLoop.getInductionVar();
+  ValueRange outerIterArgs = outerIterLoop.getRegionIterValues();
+
+  Value outerOffset = rewriter.create<MulIOp>(loc, outerIdx, outerStep);
+  Value actualOuterIdx = rewriter.create<AddIOp>(loc, tileStart, outerOffset);
+
+  // Build the mapping from original values to new values
+  IRMapping outerMapper;
+  outerMapper.map(outerInductionVar, actualOuterIdx);
+  for (auto [origArg, newArg] : llvm::zip(outerRegionIterValues, outerIterArgs))
+    outerMapper.map(origArg, newArg);
+
+  // Clone and transform operations
+  for (Operation *op : outerBodyOps) {
+    auto it = innerLoopInfos.find(op);
+    if (it != innerLoopInfos.end()) {
+      // This is an MMA reduction inner loop - transform it
+      const InnerLoopInfo &info = it->second;
+      
+      Value innerLb = outerMapper.lookupOrDefault(info.lb);
+      Value innerUb = outerMapper.lookupOrDefault(info.ub);
+      Value innerStep = outerMapper.lookupOrDefault(info.step);
+
+      SmallVector<Value> mappedInnerInit;
+      for (Value v : info.initValues)
+        mappedInnerInit.push_back(outerMapper.lookupOrDefault(v));
+
+      Value innerRange = rewriter.create<SubIOp>(loc, innerUb, innerLb);
+      Value numInnerIters =
+          rewriter.create<DivIOp>(loc, innerRange, innerStep, Signedness::Signed);
+
+      auto newInnerLoop = rewriter.create<ForOp>(loc, zero, numInnerIters, one,
+                                                  mappedInnerInit);
+
+      // Build inner loop body
+      OpBuilder::InsertionGuard guard(rewriter);
+      Block *innerBody = newInnerLoop.getBody();
+      rewriter.setInsertionPointToStart(innerBody);
+      Value innerIdx = newInnerLoop.getInductionVar();
+      ValueRange innerIterArgs = newInnerLoop.getRegionIterValues();
+
+      // Compute forward/reverse indices
+      Value forwardOffset = rewriter.create<MulIOp>(loc, innerIdx, innerStep);
+      Value forwardJ = rewriter.create<AddIOp>(loc, innerLb, forwardOffset);
+
+      Value innerIdxPlusOne = rewriter.create<AddIOp>(loc, innerIdx, one);
+      Value reverseOffset = rewriter.create<MulIOp>(loc, innerIdxPlusOne, innerStep);
+      Value reverseJ = rewriter.create<SubIOp>(loc, innerUb, reverseOffset);
+
+      Value actualInnerIdx = rewriter.create<SelectOp>(loc, isOdd, reverseJ, forwardJ);
+
+      // Build inner mapper - include outerMapper so we can reference cloned outer values
+      IRMapping innerMapper(outerMapper);  // Inherit all outer mappings
+      innerMapper.map(info.inductionVar, actualInnerIdx);
+      for (auto [origArg, newArg] : llvm::zip(info.regionIterValues, innerIterArgs))
+        innerMapper.map(origArg, newArg);
+
+      // Clone inner body using pre-captured info
+      for (Operation *innerOp : info.bodyOps) {
+        rewriter.clone(*innerOp, innerMapper);
+      }
+
+      // Create inner continue
+      SmallVector<Value> mappedInnerContinue;
+      for (Value v : info.continueOperands)
+        mappedInnerContinue.push_back(innerMapper.lookupOrDefault(v));
+      rewriter.create<ContinueOp>(loc, mappedInnerContinue);
+
+      // Map inner loop results
+      for (auto [origResult, newResult] : llvm::zip(info.results, newInnerLoop.getResults()))
+        outerMapper.map(origResult, newResult);
+
+      rewriter.setInsertionPointAfter(newInnerLoop);
+    } else {
+      // Clone other operations
+      rewriter.clone(*op, outerMapper);
+    }
+  }
+
+  // Create outer continue using pre-captured operands
+  SmallVector<Value> mappedOuterContinue;
+  for (Value v : outerContinueOperands)
+    mappedOuterContinue.push_back(outerMapper.lookupOrDefault(v));
+  rewriter.create<ContinueOp>(loc, mappedOuterContinue);
+
+  rewriter.setInsertionPointAfter(outerIterLoop);
+  rewriter.create<ContinueOp>(loc, outerIterLoop.getResults());
+
+  rewriter.replaceOp(outerLoop, tileLoop.getResults());
+}
+
+#define GEN_PASS_DEF_ALTERNATEREDUCTIONLOOPPASS
+#include "cuda_tile/Dialect/CudaTile/Transforms/Passes.h.inc"
+
+struct AlternateReductionLoopPass
+    : public impl::AlternateReductionLoopPassBase<AlternateReductionLoopPass> {
+public:
+  using impl::AlternateReductionLoopPassBase<
+      AlternateReductionLoopPass>::AlternateReductionLoopPassBase;
+
+  void runOnOperation() override {
+    Operation *op = getOperation();
+    MLIRContext *ctx = &getContext();
+    IRRewriter rewriter(ctx);
+
+    // Only transform ONCE
+    ForOp outerLoop = findOutermostLoopWithMmaReductions(op);
+    if (outerLoop) {
+      rewriter.setInsertionPoint(outerLoop);
+      transformOuterLoop(rewriter, outerLoop, tileXFactor);
+    }
+  }
+};
+
+} // namespace mlir::cuda_tile
