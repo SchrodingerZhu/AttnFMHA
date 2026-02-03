@@ -1,0 +1,30 @@
+# LaTeX byproducts (mklatex/pdflatex/bibtex)
+doc/*.aux
+doc/*.bbl
+doc/*.blg
+doc/*.log
+doc/*.out
+doc/*.toc
+doc/*.lof
+doc/*.lot
+doc/*.fls
+doc/*.fdb_latexmk
+doc/*.synctex.gz
+doc/*.synctex(busy)
+doc/*.nav
+doc/*.snm
+doc/*.vrb
+doc/*.cut
+doc/*.latexmk
+doc/*.xdv
+
+# PDF output
+doc/*.pdf
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Zip files (optional - remove if you want to track these)
+*.zip

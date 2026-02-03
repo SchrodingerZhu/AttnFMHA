@@ -1,0 +1,154 @@
+@inproceedings{FlashAttention,
+  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  title     = {{FlashAttention}: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022},
+  volume    = {35},
+  url       = {https://arxiv.org/abs/2205.14135}
+}
+
+@inproceedings{AttentionIsAllYouNeed,
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  title     = {Attention is All You Need},
+  booktitle = {Advances in Neural Information Processing Systems (NIPS)},
+  year      = {2017},
+  volume    = {30},
+  url       = {https://arxiv.org/abs/1706.03762}
+}
+
+@inproceedings{GPT3,
+  author    = {Brown, Tom and Mann, Benjamin and Ryder, Nick and Subbiah, Melanie and Kaplan, Jared D and Dhariwal, Prafulla and Neelakantan, Arvind and Shyam, Pranav and Sastry, Girish and Askell, Amanda and others},
+  title     = {Language Models are Few-Shot Learners},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2020},
+  volume    = {33},
+  pages     = {1877--1901},
+  url       = {https://arxiv.org/abs/2005.14165}
+}
+
+@manual{PTXISA,
+  title  = {Parallel Thread Execution ISA Version 9.1},
+  author = {{NVIDIA Corporation}},
+  year   = {2026},
+  url    = {https://docs.nvidia.com/cuda/parallel-thread-execution/index.html}
+}
+
+@misc{su2025cudal2surpassingcublasperformance,
+  title         = {CUDA-L2: Surpassing cuBLAS Performance for Matrix Multiplication through Reinforcement Learning},
+  author        = {Songqiao Su and Xiaofei Sun and Xiaoya Li and Albert Wang and Jiwei Li and Chris Shum},
+  year          = {2025},
+  eprint        = {2512.02551},
+  archiveprefix = {arXiv},
+  primaryclass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2512.02551}
+}
+
+@online{CUDATile,
+  title = {{NVIDIA} {CUDA} Tile},
+  year  = {2025},
+  url   = {https://developer.nvidia.com/cuda/tile},
+}
+
+@manual{nvidia_nsight_compute_cli,
+  title        = {Nsight Compute CLI User Guide},
+  author       = {{NVIDIA Corporation}},
+  year         = {2025},
+  note         = {Version 2025.4.1},
+  url          = {https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html},
+  organization = {NVIDIA Corporation}
+}
+
+@inproceedings{skende2025nvidia,
+  title     = {NVIDIA GB10 SoC: AI Supercomputer On Your Desk},
+  author    = {Skende, Andi},
+  booktitle = {2025 IEEE Hot Chips 37 Symposium (HCS)},
+  year      = {2025},
+  month     = {August},
+  url       = {https://hc2025.hotchips.org/assets/program/conference/day2/21_nvidia_skende_final.pdf}
+}
+
+@inproceedings{10.1109/MICRO.2012.16,
+author = {Rogers, Timothy G. and O'Connor, Mike and Aamodt, Tor M.},
+title = {Cache-Conscious Wavefront Scheduling},
+year = {2012},
+isbn = {9780769549248},
+publisher = {IEEE Computer Society},
+address = {USA},
+url = {https://doi.org/10.1109/MICRO.2012.16},
+doi = {10.1109/MICRO.2012.16},
+abstract = {This paper studies the effects of hardware thread scheduling on cache management in GPUs. We propose Cache-Conscious Wave front Scheduling (CCWS), an adaptive hardware mechanism that makes use of a novel intra-wave front locality detector to capture locality that is lost by other schedulers due to excessive contention for cache capacity. In contrast to improvements in the replacement policy that can better tolerate difficult access patterns, CCWS shapes the access pattern to avoid thrashing the shared L1. We show that CCWS can outperform any replacement scheme by evaluating against the Belady-optimal policy. Our evaluation demonstrates that cache efficiency and preservation of intra-wave front locality become more important as GPU computing expands beyond use in high performance computing. At an estimated cost of 0.17\% total chip area, CCWS reduces the number of threads actively issued on a core when appropriate. This leads to an average 25\% fewer L1 data cache misses which results in a harmonic mean 24\% performance improvement over previously proposed scheduling policies across a diverse selection of cache-sensitive workloads.},
+booktitle = {Proceedings of the 2012 45th Annual IEEE/ACM International Symposium on Microarchitecture},
+pages = {72–83},
+numpages = {12},
+location = {Vancouver, B.C., CANADA},
+series = {MICRO-45}
+}
+
+@INPROCEEDINGS{6835937,
+  author={Lee, Minseok and Song, Seokwoo and Moon, Joosik and Kim, John and Seo, Woong and Cho, Yeongon and Ryu, Soojung},
+  booktitle={2014 IEEE 20th International Symposium on High Performance Computer Architecture (HPCA)}, 
+  title={Improving GPGPU resource utilization through alternative thread block scheduling}, 
+  year={2014},
+  volume={},
+  number={},
+  pages={260-271},
+  keywords={Instruction sets;Scheduling;Kernel;Resource management;Hardware;Graphics processing units;Memory management},
+  doi={10.1109/HPCA.2014.6835937}}
+
+@inproceedings{10.1145/3037697.3037709,
+author = {Li, Ang and Song, Shuaiwen Leon and Liu, Weifeng and Liu, Xu and Kumar, Akash and Corporaal, Henk},
+title = {Locality-Aware CTA Clustering for Modern GPUs},
+year = {2017},
+isbn = {9781450344654},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3037697.3037709},
+doi = {10.1145/3037697.3037709},
+abstract = {Cache is designed to exploit locality; however, the role of on-chip L1 data caches on modern GPUs is often awkward. The locality among global memory requests from different SMs (Streaming Multiprocessors) is predominantly harvested by the commonly-shared L2 with long access latency; while the in-core locality, which is crucial for performance delivery, is handled explicitly by user-controlled scratchpad memory. In this work, we disclose another type of data locality that has been long ignored but with performance boosting potential --- the inter-CTA locality. Exploiting such locality is rather challenging due to unclear hardware feasibility, unknown and inaccessible underlying CTA scheduler, and small in-core cache capacity. To address these issues, we first conduct a thorough empirical exploration on various modern GPUs and demonstrate that inter-CTA locality can be harvested, both spatially and temporally, on L1 or L1/Tex unified cache. Through further quantification process, we prove the significance and commonality of such locality among GPU applications, and discuss whether such reuse is exploitable. By leveraging these insights, we propose the concept of CTA-Clustering and its associated software-based techniques to reshape the default CTA scheduling in order to group the CTAs with potential reuse together on the same SM. Our techniques require no hardware modification and can be directly deployed on existing GPUs. In addition, we incorporate these techniques into an integrated framework for automatic inter-CTA locality optimization. We evaluate our techniques using a wide range of popular GPU applications on all modern generations of NVIDIA GPU architectures. The results show that our proposed techniques significantly improve cache performance through reducing L2 cache transactions by 55\%, 65\%, 29\%, 28\% on average for Fermi, Kepler, Maxwell and Pascal, respectively, leading to an average of 1.46x, 1.48x, 1.45x, 1.41x (up to 3.8x, 3.6x, 3.1x, 3.3x) performance speedups for applications with algorithm-related inter-CTA reuse.},
+booktitle = {Proceedings of the Twenty-Second International Conference on Architectural Support for Programming Languages and Operating Systems},
+pages = {297–311},
+numpages = {15},
+keywords = {cache locality, cta, gpu, performance optimization, runtime tool},
+location = {Xi'an, China},
+series = {ASPLOS '17}
+}
+
+@article{10.1145/3093337.3037709,
+author = {Li, Ang and Song, Shuaiwen Leon and Liu, Weifeng and Liu, Xu and Kumar, Akash and Corporaal, Henk},
+title = {Locality-Aware CTA Clustering for Modern GPUs},
+year = {2017},
+issue_date = {March 2017},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+volume = {45},
+number = {1},
+issn = {0163-5964},
+url = {https://doi.org/10.1145/3093337.3037709},
+doi = {10.1145/3093337.3037709},
+abstract = {Cache is designed to exploit locality; however, the role of on-chip L1 data caches on modern GPUs is often awkward. The locality among global memory requests from different SMs (Streaming Multiprocessors) is predominantly harvested by the commonly-shared L2 with long access latency; while the in-core locality, which is crucial for performance delivery, is handled explicitly by user-controlled scratchpad memory. In this work, we disclose another type of data locality that has been long ignored but with performance boosting potential --- the inter-CTA locality. Exploiting such locality is rather challenging due to unclear hardware feasibility, unknown and inaccessible underlying CTA scheduler, and small in-core cache capacity. To address these issues, we first conduct a thorough empirical exploration on various modern GPUs and demonstrate that inter-CTA locality can be harvested, both spatially and temporally, on L1 or L1/Tex unified cache. Through further quantification process, we prove the significance and commonality of such locality among GPU applications, and discuss whether such reuse is exploitable. By leveraging these insights, we propose the concept of CTA-Clustering and its associated software-based techniques to reshape the default CTA scheduling in order to group the CTAs with potential reuse together on the same SM. Our techniques require no hardware modification and can be directly deployed on existing GPUs. In addition, we incorporate these techniques into an integrated framework for automatic inter-CTA locality optimization. We evaluate our techniques using a wide range of popular GPU applications on all modern generations of NVIDIA GPU architectures. The results show that our proposed techniques significantly improve cache performance through reducing L2 cache transactions by 55\%, 65\%, 29\%, 28\% on average for Fermi, Kepler, Maxwell and Pascal, respectively, leading to an average of 1.46x, 1.48x, 1.45x, 1.41x (up to 3.8x, 3.6x, 3.1x, 3.3x) performance speedups for applications with algorithm-related inter-CTA reuse.},
+journal = {SIGARCH Comput. Archit. News},
+month = apr,
+pages = {297–311},
+numpages = {15},
+keywords = {runtime tool, performance optimization, gpu, cta, cache locality}
+}
+
+@article{10.1145/3093336.3037709,
+author = {Li, Ang and Song, Shuaiwen Leon and Liu, Weifeng and Liu, Xu and Kumar, Akash and Corporaal, Henk},
+title = {Locality-Aware CTA Clustering for Modern GPUs},
+year = {2017},
+issue_date = {April 2017},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+volume = {52},
+number = {4},
+issn = {0362-1340},
+url = {https://doi.org/10.1145/3093336.3037709},
+doi = {10.1145/3093336.3037709},
+abstract = {Cache is designed to exploit locality; however, the role of on-chip L1 data caches on modern GPUs is often awkward. The locality among global memory requests from different SMs (Streaming Multiprocessors) is predominantly harvested by the commonly-shared L2 with long access latency; while the in-core locality, which is crucial for performance delivery, is handled explicitly by user-controlled scratchpad memory. In this work, we disclose another type of data locality that has been long ignored but with performance boosting potential --- the inter-CTA locality. Exploiting such locality is rather challenging due to unclear hardware feasibility, unknown and inaccessible underlying CTA scheduler, and small in-core cache capacity. To address these issues, we first conduct a thorough empirical exploration on various modern GPUs and demonstrate that inter-CTA locality can be harvested, both spatially and temporally, on L1 or L1/Tex unified cache. Through further quantification process, we prove the significance and commonality of such locality among GPU applications, and discuss whether such reuse is exploitable. By leveraging these insights, we propose the concept of CTA-Clustering and its associated software-based techniques to reshape the default CTA scheduling in order to group the CTAs with potential reuse together on the same SM. Our techniques require no hardware modification and can be directly deployed on existing GPUs. In addition, we incorporate these techniques into an integrated framework for automatic inter-CTA locality optimization. We evaluate our techniques using a wide range of popular GPU applications on all modern generations of NVIDIA GPU architectures. The results show that our proposed techniques significantly improve cache performance through reducing L2 cache transactions by 55\%, 65\%, 29\%, 28\% on average for Fermi, Kepler, Maxwell and Pascal, respectively, leading to an average of 1.46x, 1.48x, 1.45x, 1.41x (up to 3.8x, 3.6x, 3.1x, 3.3x) performance speedups for applications with algorithm-related inter-CTA reuse.},
+journal = {SIGPLAN Not.},
+month = apr,
+pages = {297–311},
+numpages = {15},
+keywords = {runtime tool, performance optimization, gpu, cta, cache locality}
+}
