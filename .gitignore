@@ -27,4 +27,5 @@ __pycache__/
 *.pyo
 
 # Zip files (optional - remove if you want to track these)
-*.ziplatent_memory/logs/
+*.zip
+latent_memory/logs/
