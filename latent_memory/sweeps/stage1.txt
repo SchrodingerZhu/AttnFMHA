@@ -1,0 +1,9 @@
+# Stage 1: write addressing, plus baselines. 16 facts/stream, N = 16 rows.
+--name none --set mem_type=none
+--name slot_separate --set mem_type=slot addr=separate
+--name slot_tied --set mem_type=slot addr=tied
+--name slot_shift --set mem_type=slot addr=shift
+--name kv_full_shift --set mem_type=kv kv_capacity=192 addr=shift
+--name kv_full_tied --set mem_type=kv kv_capacity=192 addr=tied
+--name kv_full_separate --set mem_type=kv kv_capacity=192 addr=separate
+--name slot_shift_k1 --set mem_type=slot addr=shift top_k=1
