@@ -49,6 +49,7 @@ def make_batch(rng, batch, episodes, keys_per_stream=16, n_reveal=4, n_query=8, 
                 tokens[e, b, 2 * j] = k
                 tokens[e, b, 2 * j + 1] = VAL_OFFSET + value[k]
             candidates = [k for k in last_seen if k not in set(shown)]
+            asked = set()
             for j in range(n_query):
                 pos = 2 * n_reveal + 3 * j
                 tokens[e, b, pos] = QUERY_TOK
@@ -57,7 +58,10 @@ def make_batch(rng, batch, episodes, keys_per_stream=16, n_reveal=4, n_query=8, 
                     tokens[e, b, pos + 1] = k
                     tokens[e, b, pos + 2] = VAL_OFFSET + value[k]
                     targets[e, b, pos + 1] = VAL_OFFSET + value[k]  # predict v from "Q k"
-                    mask[e, b, pos + 1] = 1.0
+                    # A repeated query is answerable from this episode's context,
+                    # so only the first ask of each key counts.
+                    mask[e, b, pos + 1] = float(k not in asked)
+                    asked.add(k)
                 else:  # first episode: nothing to recall yet
                     tokens[e, b, pos + 1] = shown[0]
                     tokens[e, b, pos + 2] = VAL_OFFSET + value[shown[0]]
