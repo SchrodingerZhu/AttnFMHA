@@ -1,0 +1,5 @@
+# Stage 1b: longer training, to get past the recall plateau.
+--name L_slot_shift_f16 --steps 6000 --lr 3e-3 --set mem_type=slot addr=shift
+--name L_kv_full_sep_f16 --steps 6000 --lr 3e-3 --set mem_type=kv kv_capacity=192 addr=separate
+--name L_slot_shift_f8 --steps 6000 --lr 3e-3 --keys 8 --set mem_type=slot addr=shift
+--name L_kv_full_sep_f8 --steps 6000 --lr 3e-3 --keys 8 --set mem_type=kv kv_capacity=192 addr=separate

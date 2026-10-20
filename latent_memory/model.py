@@ -23,6 +23,9 @@ Design axes (all in Config):
               "separate"  own projection of the final hidden state
               "tied"      the read query at the same position
               "shift"     the read query at the previous position (write "v" under "k")
+  addr_src    where the read query comes from: "deep" (layer-R hidden state) or
+              "embed" (token embedding: context-free, known before layer 0, so
+              the rows could be prefetched; a learned 1-gram analogue of Engram's hash)
   decoder     what happens after the gather: "sum" | "conv" | "mlp"
   write_rule  "avg"    M_i <- (M_i + U_i) / (1 + S_i)   bounded gradient step
               "decay"  M_i <- lam * M_i + U_i            fast-weight accumulation
@@ -44,6 +47,7 @@ class Config:
     read_layer: int = 1     # memory is read after this block
     mem_type: str = "slot"
     addr: str = "shift"
+    addr_src: str = "deep"  # read query from layer-R hidden ("deep") or token embedding ("embed")
     decoder: str = "conv"
     write_rule: str = "avg"
     mem_rows: int = 16      # N (slot memory)
@@ -168,8 +172,9 @@ def _decode(p, mixed, cfg: Config):
     return jnp.tanh(p["read_gate"]) * (_rms_norm(mixed, p["read_norm"]) @ p["read_out"])
 
 
-def _read_query(p, h):
-    return _rms_norm(h, p["read_ln"]) @ p["read_q"]
+def _read_query(p, h, emb, cfg: Config):
+    src = h if cfg.addr_src == "deep" else emb
+    return _rms_norm(src, p["read_ln"]) @ p["read_q"]
 
 
 def _write_query(p, q_read, h_final, cfg: Config):
@@ -182,8 +187,8 @@ def _write_query(p, q_read, h_final, cfg: Config):
     raise ValueError(cfg.addr)
 
 
-def slot_read(p, mem, h, cfg: Config):
-    q = _read_query(p, h)
+def slot_read(p, mem, h, emb, cfg: Config):
+    q = _read_query(p, h, emb, cfg)
     idx, w = route(p["row_keys"], q, cfg.top_k)                   # [B, T, k]
     rows = jax.vmap(lambda m, i: m[i])(mem, idx)                  # [B, T, k, d_mem]
     if cfg.decoder == "mlp":
@@ -215,9 +220,9 @@ def slot_write(p, mem, q_read, h, cfg: Config):
     return new_mem, {"gate": g, "row_usage": usage}
 
 
-def kv_read(p, mem, h, cfg: Config):
+def kv_read(p, mem, h, emb, cfg: Config):
     """Dense softmax attention over the cached entries."""
-    q = _read_query(p, h)
+    q = _read_query(p, h, emb, cfg)
     scores = jnp.einsum("btd,bcd->btc", q, mem["k"]) / jnp.sqrt(cfg.d_key)
     scores = jnp.where(mem["score"][:, None, :] > -1e8, scores, -1e9)
     mixed = jnp.einsum("btc,bcd->btd", jax.nn.softmax(scores, -1), mem["v"])
@@ -245,13 +250,14 @@ def kv_write(p, mem, q_read, h, cfg: Config):
 def forward(params, mem, tokens, cfg: Config):
     """One episode. Returns logits, the updated memory, and some diagnostics."""
     p = params["memory"]
-    x = params["embed"][tokens] + params["pos"][: tokens.shape[1]]
+    emb = params["embed"][tokens]
+    x = emb + params["pos"][: tokens.shape[1]]
     q_read = None
     for i, bp in enumerate(params["blocks"]):
         x = _block(bp, x, cfg.n_heads)
         if i == cfg.read_layer and cfg.mem_type != "none":
             read = slot_read if cfg.mem_type == "slot" else kv_read
-            delta, q_read, _ = read(p, mem, x, cfg)
+            delta, q_read, _ = read(p, mem, x, emb, cfg)
             x = x + delta
     h = _rms_norm(x, params["ln_f"])
     logits = h @ params["embed"].T
