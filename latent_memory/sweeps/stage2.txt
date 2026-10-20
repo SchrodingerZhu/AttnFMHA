@@ -1,0 +1,5 @@
+# Stage 2: address from the token embedding (context-free); 16 facts/stream.
+--name E_slot_N16 --steps 3000 --set mem_type=slot addr=shift addr_src=embed mem_rows=16
+--name E_slot_N8 --steps 3000 --set mem_type=slot addr=shift addr_src=embed mem_rows=8
+--name E_kv_full --steps 3000 --set mem_type=kv kv_capacity=192 addr=shift addr_src=embed
+--name E_kv_eqbytes_C10 --steps 3000 --set mem_type=kv kv_capacity=10 addr=shift addr_src=embed
