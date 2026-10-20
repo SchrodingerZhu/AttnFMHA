@@ -1,0 +1,9 @@
+# Stage 3: capacity, compression, fair KV eviction, drift, decoder/write ablations. 16 facts/stream.
+--name S3_slot_N32 --steps 3000 --set addr_src=embed mem_rows=32
+--name S3_slot_N64 --steps 3000 --set addr_src=embed mem_rows=64
+--name S3_slot_N8_k1 --steps 3000 --set addr_src=embed mem_rows=8 top_k=1
+--name S3_kv_fifo_C10 --steps 3000 --set mem_type=kv kv_capacity=10 kv_evict=fifo_gated addr_src=embed
+--name S3_slot_N64_drift --steps 3000 --drift 0.5 --set addr_src=embed mem_rows=64
+--name S3_kv_full_drift --steps 3000 --drift 0.5 --set mem_type=kv kv_capacity=192 addr_src=embed
+--name S3_slot_N16_decay --steps 3000 --set addr_src=embed mem_rows=16 write_rule=decay
+--name S3_slot_N16_sum --steps 3000 --set addr_src=embed mem_rows=16 decoder=sum

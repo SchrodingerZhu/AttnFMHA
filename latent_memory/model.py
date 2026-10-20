@@ -52,6 +52,7 @@ class Config:
     write_rule: str = "avg"
     mem_rows: int = 16      # N (slot memory)
     kv_capacity: int = 16   # C (kv memory)
+    kv_evict: str = "learned"  # "learned" (keep top gate logits) | "fifo_gated" (keep newest open-gate entries)
     d_mem: int = 64
     d_key: int = 32
     top_k: int = 4
@@ -236,9 +237,16 @@ def kv_write(p, mem, q_read, h, cfg: Config):
     logit = (h @ p["write_g"])[..., 0] + p["write_g_bias"]
     g = jax.nn.sigmoid(logit)
     v_new = g[..., None] * (h @ p["write_v"])
+    if cfg.kv_evict == "fifo_gated":
+        # Newest entries whose gate is open win; closed-gate entries go first.
+        base = jnp.maximum(mem["score"].max(1, keepdims=True), 0.0)
+        recency = base + 1.0 + jnp.arange(k_new.shape[1])
+        s_new = jnp.where(g > 0.5, recency, -1e7 + recency)
+    else:
+        s_new = logit
     k_all = jnp.concatenate([mem["k"], k_new], 1)
     v_all = jnp.concatenate([mem["v"], v_new], 1)
-    s_all = jnp.concatenate([mem["score"], jax.lax.stop_gradient(logit)], 1)
+    s_all = jnp.concatenate([mem["score"], jax.lax.stop_gradient(s_new)], 1)
     keep_s, keep = jax.lax.top_k(s_all, cfg.kv_capacity)
     take = jax.vmap(lambda x, i: x[i])
     new_mem = {"k": take(k_all, keep), "v": take(v_all, keep), "score": keep_s}
