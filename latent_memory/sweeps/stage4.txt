@@ -1,0 +1,5 @@
+# Stage 4: confirm the best combination, controls, and seed variance.
+--name S4_slot_N64_sum --steps 3000 --set addr_src=embed mem_rows=64 decoder=sum
+--name S4_slot_N16_sum_deep --steps 3000 --set addr_src=deep mem_rows=16 decoder=sum
+--name S4_slot_N8_sum --steps 3000 --set addr_src=embed mem_rows=8 decoder=sum
+--name S4_slot_N16_sum_seed1 --steps 3000 --seed 1 --set addr_src=embed mem_rows=16 decoder=sum
